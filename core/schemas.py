@@ -51,8 +51,15 @@ class LeadSession(BaseModel):
     )
 
     submitted: bool = False
+    delivery_status: Literal[
+        "not_sent",
+        "sending",
+        "sent",
+        "uncertain",
+    ] = "not_sent"
     awaiting_confirmation: bool = False
-
+    confirmation_message_id: int | None = None
+    
     lead: ProjectLead = Field(default_factory=ProjectLead)
     history: list[dict[str, str]] = Field(default_factory=list)
 

@@ -1,0 +1,14 @@
+services:
+  ai-lead-assistant:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ai-lead-assistant
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ai_lead_data:/app/data
+
+volumes:
+  ai_lead_data:

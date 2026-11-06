@@ -44,3 +44,21 @@ def test_delete_session(tmp_path):
     repository.delete(123)
 
     assert repository.get(123) is None
+
+
+def test_confirmation_message_id_persists(tmp_path):
+    db_path = tmp_path / "sessions.db"
+    repository = SessionRepository(str(db_path))
+
+    session = LeadSession(user_id=123, chat_id=123)
+    session.awaiting_confirmation = True
+    session.confirmation_message_id = 456
+
+    repository.save(session)
+
+    restored = SessionRepository(str(db_path)).get(123)
+
+    assert restored is not None
+    assert restored.awaiting_confirmation is True
+    assert restored.confirmation_message_id == 456
+
