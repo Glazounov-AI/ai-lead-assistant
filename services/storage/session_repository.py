@@ -67,3 +67,108 @@ class SessionRepository:
                 "DELETE FROM sessions WHERE user_id = ?",
                 (user_id,),
             )
+
+
+    def save_delivery(
+        self,
+        session: LeadSession,
+        event_status: str,
+        telegram_message_id: int | None = None,
+    ) -> None:
+        """Сохранить состояние сессии, заявку и событие
+        доставки одной транзакцией.
+        """
+        from datetime import datetime, timezone
+
+        if event_status not in {
+            "sending",
+            "sent",
+            "uncertain",
+        }:
+            raise ValueError("Недопустимое событие доставки")
+
+        if session.delivery_status != event_status:
+            raise ValueError(
+                "Событие не соответствует состоянию заявки"
+            )
+
+        now = datetime.now(timezone.utc).isoformat()
+        session_json = session.model_dump_json()
+
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS leads (
+                    lead_id TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    session_json TEXT NOT NULL,
+                    delivery_status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS delivery_attempts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    lead_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    telegram_message_id INTEGER,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (lead_id)
+                        REFERENCES leads(lead_id)
+                )
+            """)
+
+            db.execute("""
+                INSERT INTO sessions (user_id, session_json)
+                VALUES (?, ?)
+                ON CONFLICT(user_id)
+                DO UPDATE SET
+                    session_json = excluded.session_json
+            """, (
+                session.user_id,
+                session_json,
+            ))
+
+            db.execute("""
+                INSERT INTO leads (
+                    lead_id,
+                    user_id,
+                    session_json,
+                    delivery_status,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(lead_id)
+                DO UPDATE SET
+                    session_json = excluded.session_json,
+                    delivery_status = excluded.delivery_status,
+                    updated_at = excluded.updated_at
+            """, (
+                session.lead_id,
+                session.user_id,
+                session_json,
+                session.delivery_status,
+                now,
+                now,
+            ))
+
+            db.execute("""
+                INSERT INTO delivery_attempts (
+                    lead_id,
+                    status,
+                    telegram_message_id,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?)
+            """, (
+                session.lead_id,
+                event_status,
+                telegram_message_id,
+                now,
+            ))
+
+

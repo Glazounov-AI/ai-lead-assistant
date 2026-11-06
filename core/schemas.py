@@ -1,9 +1,9 @@
-
 from datetime import datetime, timezone
 from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from uuid import uuid4
 
 class ProjectLead(BaseModel):
     """Заявка на разработку AI-решения."""
@@ -43,6 +43,7 @@ class LeadSession(BaseModel):
 
     user_id: int
     chat_id: int
+    lead_id: str = Field(default_factory=lambda: str(uuid4()))
     username: str | None = None
     first_name: str | None = None
 

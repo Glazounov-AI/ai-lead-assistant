@@ -22,6 +22,8 @@ from services.workflow import LeadWorkflow
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import CallbackQueryHandler
 
+from bot.operator_commands import leads_command, lead_command
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -220,16 +222,18 @@ async def confirm_lead(
 
         # Сначала фиксируем начало отправки в SQLite.
         workflow.begin_delivery(session)
-        repository.save(session)
+        repository.save_delivery(session, "sending")
 
         try:
-            await context.bot.send_message(
+            sent_message = await context.bot.send_message(
                 chat_id=operator_chat_id,
                 text=(
-                    "Новая заявка на AI-решение\n\n"
+                    f"Новая заявка на AI-решение\n"
+                    f"ID: {session.lead_id}\n\n"
                     + summary
-                ),
+                ),            
             )
+
         except Exception:
             logger.exception(
                 "Результат отправки заявки неизвестен"
@@ -238,7 +242,7 @@ async def confirm_lead(
             # Исключение не доказывает,
             # что Telegram не принял сообщение.
             workflow.delivery_uncertain(session)
-            repository.save(session)
+            repository.save_delivery(session, "uncertain")
 
             await query.message.reply_text(
                 "Не удалось подтвердить доставку заявки. "
@@ -250,7 +254,11 @@ async def confirm_lead(
 
         # Telegram подтвердил приём сообщения.
         workflow.delivery_succeeded(session)
-        repository.save(session)
+        repository.save_delivery(
+            session,
+            "sent",
+            telegram_message_id=sent_message.message_id,
+        )
 
         # Ошибка обновления кнопок не должна
         # менять уже сохранённый статус sent.
@@ -343,7 +351,6 @@ async def handle_message(
 
     await message.reply_text(turn.reply)
 
-
     if session.awaiting_confirmation:
         keyboard = InlineKeyboardMarkup(
             [
@@ -362,20 +369,21 @@ async def handle_message(
             ]
         )
 
-    confirmation_message = await message.reply_text(
-        workflow.format_summary(session.lead)
-        + "\n\nПроверьте сведения. "
-        "Нажимая «Отправить заявку», "
-        "вы соглашаетесь передать указанные данные "
-        "для обратной связи.",
-        reply_markup=keyboard,
-    )
+        confirmation_message = await message.reply_text(
+            workflow.format_summary(session.lead)
+            + "\n\nПроверьте сведения. "
+            "Нажимая «Отправить заявку», "
+            "вы соглашаетесь передать указанные данные "
+            "для обратной связи.",
+            reply_markup=keyboard,
+        )
 
-    session.confirmation_message_id = (
-        confirmation_message.message_id
-    )
+        session.confirmation_message_id = (
+            confirmation_message.message_id
+        )
 
-    repository.save(session)
+        repository.save(session)
+
 
 
 def main() -> None:
@@ -394,6 +402,14 @@ def main() -> None:
 
     application.add_handler(
         CommandHandler("cancel", cancel)
+    )
+
+    application.add_handler(
+        CommandHandler("leads", leads_command)
+    )
+
+    application.add_handler(
+        CommandHandler("lead", lead_command)
     )
 
     application.add_handler(

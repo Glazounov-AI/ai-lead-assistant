@@ -51,6 +51,9 @@ def test_repeated_confirmation_sends_once(monkeypatch, tmp_path):
     bot = SimpleNamespace(
         send_message=AsyncMock()
     )
+
+    bot.send_message.return_value.message_id = 98765
+
     context = SimpleNamespace(bot=bot)
 
     async def run_test():
