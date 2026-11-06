@@ -64,6 +64,7 @@ def test_repeated_confirmation_sends_once(monkeypatch, tmp_path):
     restored = repository.get(123)
     assert restored is not None
     assert restored.submitted is True
+    assert restored.delivery_status == "sent"
     assert restored.awaiting_confirmation is False
 
 
@@ -129,12 +130,65 @@ def test_failed_delivery_keeps_lead_unsubmitted(
     assert restored is not None
     assert restored.submitted is False
     assert restored.awaiting_confirmation is True
-    assert restored.lead.consent_to_contact is None
+    assert restored.delivery_status == "uncertain"
+    assert restored.lead.consent_to_contact is True
 
     assert bot.send_message.await_count == 1
     message.reply_text.assert_awaited_once_with(
-        "Не удалось отправить заявку. "
-        "Попробуйте подтвердить ещё раз."
+        "Не удалось подтвердить доставку заявки. "
+        "Повторная отправка заблокирована "
+        "во избежание дубликатов. "
+        "Свяжитесь с оператором."
     )
 
+
+
+def test_delivery_state_transitions():
+    from services.workflow import LeadWorkflow
+
+    workflow = LeadWorkflow()
+
+    session = LeadSession(
+        user_id=123,
+        chat_id=123,
+        awaiting_confirmation=True,
+        lead=ProjectLead(
+            name="Клиент",
+            contact="@client",
+            business_task="Автоматизация заявок",
+            consent_to_contact=True,
+        ),
+    )
+
+    workflow.begin_delivery(session)
+    assert session.delivery_status == "sending"
+
+    workflow.delivery_uncertain(session)
+    assert session.delivery_status == "uncertain"
+    assert session.submitted is False
+
+
+def test_delivery_success_state():
+    from services.workflow import LeadWorkflow
+
+    workflow = LeadWorkflow()
+
+    session = LeadSession(
+        user_id=123,
+        chat_id=123,
+        awaiting_confirmation=True,
+        lead=ProjectLead(
+            name="Клиент",
+            contact="@client",
+            business_task="Автоматизация заявок",
+            consent_to_contact=True,
+        ),
+    )
+
+    workflow.begin_delivery(session)
+    workflow.delivery_succeeded(session)
+
+    assert session.delivery_status == "sent"
+    assert session.submitted is True
+    assert session.awaiting_confirmation is False
 

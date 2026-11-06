@@ -55,6 +55,19 @@ async def start(
     if user is None or chat is None or chat.type != "private":
         return
 
+    existing = repository.get(user.id)
+
+    if existing is not None and existing.delivery_status in (
+        "sending",
+        "uncertain",
+    ):
+        await update.effective_message.reply_text(
+            "Предыдущая заявка ожидает проверки отправки. "
+            "Создать новую заявку пока нельзя. "
+            "Свяжитесь с оператором."
+        )
+        return
+
     session = LeadSession(
         user_id=user.id,
         chat_id=chat.id,
@@ -78,6 +91,18 @@ async def cancel(
     chat = update.effective_chat
 
     if user is None or chat is None or chat.type != "private":
+        return
+
+    existing = repository.get(user.id)
+
+    if existing is not None and existing.delivery_status in (
+        "sending",
+        "uncertain",
+    ):
+        await update.effective_message.reply_text(
+            "Заявку нельзя отменить, пока результат "
+            "её отправки не проверен оператором."
+        )
         return
 
     repository.delete(user.id)
@@ -113,37 +138,55 @@ async def confirm_lead(
     async with lock:
         session = repository.get(user.id)
 
-        # Проверяем, что кнопка относится к актуальной
-        # заявке, а не к предыдущему диалогу.
-        expected_message_id = (
-            session.confirmation_message_id
-            if session is not None
-            else None
-        )
+        if session is None:
+            await query.message.reply_text(
+                "Заявка не найдена. Отправьте /start."
+            )
+            return
 
+        # Кнопка должна принадлежать текущей заявке.
         if (
-            expected_message_id is None
-            or query.message is None
-            or query.message.message_id != expected_message_id
+            query.message is None
+            or session.confirmation_message_id is None
+            or query.message.message_id
+            != session.confirmation_message_id
+        ):
+            if query.message is not None:
+                await query.message.reply_text(
+                    "Это подтверждение устарело."
+                )
+            return
+
+        if session.delivery_status in (
+            "sending",
+            "uncertain",
         ):
             await query.message.reply_text(
-                "Это подтверждение устарело. "
-                "Используйте кнопки последней заявки."
+                "Отправка заявки уже началась, "
+                "но её результат пока не подтверждён. "
+                "Повторная отправка заблокирована. "
+                "Обратитесь к оператору для проверки."
             )
             return
 
         if (
-            session is None
-            or session.submitted
-            or not session.awaiting_confirmation
+            session.submitted
+            or session.delivery_status == "sent"
         ):
             await query.message.reply_text(
-                "Заявка уже обработана или недоступна."
+                "Заявка уже отправлена."
+            )
+            return
+
+        if not session.awaiting_confirmation:
+            await query.message.reply_text(
+                "Подтверждение сейчас недоступно."
             )
             return
 
         if query.data == "lead_edit":
             session.awaiting_confirmation = False
+            session.confirmation_message_id = None
             repository.save(session)
 
             await query.edit_message_reply_markup(
@@ -157,6 +200,8 @@ async def confirm_lead(
         if query.data != "lead_confirm":
             return
 
+        # Согласие фиксируется только после
+        # явного нажатия кнопки пользователем.
         session.lead.consent_to_contact = True
 
         if not workflow.confirm(session):
@@ -173,33 +218,60 @@ async def confirm_lead(
 
         summary = workflow.format_summary(session.lead)
 
+        # Сначала фиксируем начало отправки в SQLite.
+        workflow.begin_delivery(session)
+        repository.save(session)
+
         try:
             await context.bot.send_message(
                 chat_id=operator_chat_id,
-                text="Новая заявка на AI-решение\n\n" + summary,
+                text=(
+                    "Новая заявка на AI-решение\n\n"
+                    + summary
+                ),
             )
         except Exception:
             logger.exception(
-                "Ошибка отправки заявки оператору"
+                "Результат отправки заявки неизвестен"
             )
-            session.lead.consent_to_contact = None
+
+            # Исключение не доказывает,
+            # что Telegram не принял сообщение.
+            workflow.delivery_uncertain(session)
             repository.save(session)
+
             await query.message.reply_text(
-                "Не удалось отправить заявку. "
-                "Попробуйте подтвердить ещё раз."
+                "Не удалось подтвердить доставку заявки. "
+                "Повторная отправка заблокирована "
+                "во избежание дубликатов. "
+                "Свяжитесь с оператором."
             )
             return
 
-        workflow.mark_submitted(session)
+        # Telegram подтвердил приём сообщения.
+        workflow.delivery_succeeded(session)
         repository.save(session)
 
-        await query.edit_message_reply_markup(
-            reply_markup=None
-        )
-        await query.message.reply_text(
-            "Спасибо! Заявка отправлена. "
-            "С вами свяжутся по указанному контакту."
-        )
+        # Ошибка обновления кнопок не должна
+        # менять уже сохранённый статус sent.
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=None
+            )
+        except Exception:
+            logger.exception(
+                "Не удалось убрать кнопки заявки"
+            )
+
+        try:
+            await query.message.reply_text(
+                "Спасибо! Заявка отправлена. "
+                "С вами свяжутся по указанному контакту."
+            )
+        except Exception:
+            logger.exception(
+                "Не удалось уведомить клиента"
+            )
 
 
 async def handle_message(
