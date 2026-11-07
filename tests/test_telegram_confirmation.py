@@ -210,3 +210,94 @@ def test_delivery_success_state():
     assert session.awaiting_confirmation is False
 
 
+def test_database_failure_does_not_notify_operator(
+    monkeypatch, tmp_path
+):
+    import sqlite3
+
+    from bot import main as bot_main
+    from services.storage.session_repository import SessionRepository
+
+    repository = SessionRepository(
+        str(tmp_path / "sessions.db")
+    )
+
+    monkeypatch.setattr(bot_main, "repository", repository)
+    monkeypatch.setenv("TELEGRAM_OPERATOR_CHAT_ID", "999999")
+
+    bot_main.confirmation_locks.clear()
+
+    session = LeadSession(
+        user_id=123,
+        chat_id=123,
+        awaiting_confirmation=True,
+        confirmation_message_id=456,
+        lead=ProjectLead(
+            name="Тестовый клиент",
+            contact="@test_client",
+            business_task="Автоматизация обработки заявок",
+        ),
+    )
+    repository.save(session)
+
+    # Имитируем отказ SQLite только при сохранении
+    # подтверждённой заявки.
+    def failed_save_delivery(*args, **kwargs):
+        raise sqlite3.OperationalError(
+            "database is locked"
+        )
+
+    monkeypatch.setattr(
+        repository,
+        "save_delivery",
+        failed_save_delivery,
+    )
+
+    message = SimpleNamespace(
+        message_id=456,
+        reply_text=AsyncMock(),
+    )
+
+    query = SimpleNamespace(
+        data="lead_confirm",
+        message=message,
+        answer=AsyncMock(),
+        edit_message_reply_markup=AsyncMock(),
+    )
+
+    update = SimpleNamespace(
+        callback_query=query,
+        effective_user=SimpleNamespace(id=123),
+        effective_chat=SimpleNamespace(type="private"),
+    )
+
+    bot = SimpleNamespace(
+        send_message=AsyncMock()
+    )
+    context = SimpleNamespace(bot=bot)
+
+    asyncio.run(
+        bot_main.confirm_lead(update, context)
+    )
+
+    # Оператор не должен получить уведомление.
+    bot.send_message.assert_not_awaited()
+
+    # Пользователь должен получить сообщение об ошибке.
+    message.reply_text.assert_awaited_once_with(
+        "Не удалось сохранить заявку. "
+        "Попробуйте подтвердить её ещё раз."
+    )
+
+    # Кнопки подтверждения должны остаться доступны.
+    query.edit_message_reply_markup.assert_not_awaited()
+
+    # В базе заявка не должна быть отмечена как принятая.
+    restored = repository.get(123)
+
+    assert restored is not None
+    assert restored.submitted is False
+    assert restored.awaiting_confirmation is True
+    assert restored.delivery_status == "not_sent"
+
+
