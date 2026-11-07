@@ -1,5 +1,4 @@
-﻿
-import sqlite3
+﻿import sqlite3
 
 from core.schemas import LeadSession
 from services.storage.lead_repository import LeadRepository

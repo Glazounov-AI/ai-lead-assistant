@@ -1,4 +1,3 @@
-
 import pytest
 
 from core.schemas import AssistantTurn, LeadSession, ProjectLead

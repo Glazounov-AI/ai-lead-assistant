@@ -83,12 +83,12 @@ class LeadWorkflow:
             f"Бюджет: {lead.budget_range or '—'}"
         )
 
-    def begin_delivery(self, session: LeadSession) -> None:
+    def begin_delivery(self, session):
         if session.delivery_status != "not_sent":
             raise ValueError("Отправка уже начата")
 
-        if not self.confirm(session):
-            raise ValueError("Заявка не готова к отправке")
+        if not session.submitted or not session.lead.is_complete:
+            raise ValueError("Заявка не принята")
 
         session.delivery_status = "sending"
 
@@ -98,10 +98,10 @@ class LeadWorkflow:
 
         session.delivery_status = "uncertain"
 
-    def delivery_succeeded(self, session: LeadSession) -> None:
+
+    def delivery_succeeded(self, session):
         if session.delivery_status != "sending":
             raise ValueError("Некорректное состояние отправки")
 
-        self.mark_submitted(session)
         session.delivery_status = "sent"
 

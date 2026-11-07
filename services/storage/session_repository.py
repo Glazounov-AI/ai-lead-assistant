@@ -1,4 +1,3 @@
-
 import sqlite3
 from pathlib import Path
 
@@ -75,22 +74,27 @@ class SessionRepository:
         event_status: str,
         telegram_message_id: int | None = None,
     ) -> None:
-        """Сохранить состояние сессии, заявку и событие
-        доставки одной транзакцией.
-        """
+        """Сохранить заявку, сессию и событие одной транзакцией."""
         from datetime import datetime, timezone
 
-        if event_status not in {
-            "sending",
-            "sent",
-            "uncertain",
-        }:
+        expected_status = {
+            "accepted": "not_sent",
+            "sending": "sending",
+            "retrying": "sending",
+            "sent": "sent",
+            "uncertain": "uncertain",
+        }
+
+        if event_status not in expected_status:
             raise ValueError("Недопустимое событие доставки")
 
-        if session.delivery_status != event_status:
+        if session.delivery_status != expected_status[event_status]:
             raise ValueError(
                 "Событие не соответствует состоянию заявки"
             )
+
+        if not session.submitted:
+            raise ValueError("Заявка ещё не принята")
 
         now = datetime.now(timezone.utc).isoformat()
         session_json = session.model_dump_json()

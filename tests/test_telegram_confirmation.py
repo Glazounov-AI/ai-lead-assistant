@@ -72,15 +72,18 @@ def test_repeated_confirmation_sends_once(monkeypatch, tmp_path):
 
 
 
-def test_failed_delivery_keeps_lead_unsubmitted(
+
+def test_failed_delivery_keeps_lead_accepted(
     monkeypatch, tmp_path
 ):
     from bot import main as bot_main
     from services.storage.session_repository import SessionRepository
+    from services.storage.lead_repository import LeadRepository
 
-    repository = SessionRepository(
-        str(tmp_path / "sessions.db")
-    )
+    path = str(tmp_path / "sessions.db")
+    repository = SessionRepository(path)
+    leads = LeadRepository(path)
+
     monkeypatch.setattr(bot_main, "repository", repository)
     monkeypatch.setenv("TELEGRAM_OPERATOR_CHAT_ID", "999999")
 
@@ -129,21 +132,28 @@ def test_failed_delivery_keeps_lead_unsubmitted(
     )
 
     restored = repository.get(123)
+    registered = leads.get(session.lead_id)
 
     assert restored is not None
-    assert restored.submitted is False
-    assert restored.awaiting_confirmation is True
+    assert registered is not None
+
+    # Заявка принята, несмотря на ошибку Telegram.
+    assert restored.submitted is True
+    assert registered.submitted is True
+    assert restored.awaiting_confirmation is False
     assert restored.delivery_status == "uncertain"
+    assert registered.delivery_status == "uncertain"
     assert restored.lead.consent_to_contact is True
 
+    # RuntimeError не относится к временным сетевым
+    # ошибкам, поэтому повторной попытки нет.
     assert bot.send_message.await_count == 1
-    message.reply_text.assert_awaited_once_with(
-        "Не удалось подтвердить доставку заявки. "
-        "Повторная отправка заблокирована "
-        "во избежание дубликатов. "
-        "Свяжитесь с оператором."
-    )
 
+    message.reply_text.assert_awaited_once_with(
+        "Ваша заявка принята и сохранена. "
+        "Уведомление оператору пока не подтверждено. "
+        "Повторно оформлять заявку не нужно."
+    )
 
 
 def test_delivery_state_transitions():
@@ -154,7 +164,8 @@ def test_delivery_state_transitions():
     session = LeadSession(
         user_id=123,
         chat_id=123,
-        awaiting_confirmation=True,
+        submitted=True,
+        awaiting_confirmation=False,
         lead=ProjectLead(
             name="Клиент",
             contact="@client",
@@ -167,8 +178,10 @@ def test_delivery_state_transitions():
     assert session.delivery_status == "sending"
 
     workflow.delivery_uncertain(session)
+
     assert session.delivery_status == "uncertain"
-    assert session.submitted is False
+    assert session.submitted is True
+
 
 
 def test_delivery_success_state():
@@ -179,7 +192,8 @@ def test_delivery_success_state():
     session = LeadSession(
         user_id=123,
         chat_id=123,
-        awaiting_confirmation=True,
+        submitted=True,
+        awaiting_confirmation=False,
         lead=ProjectLead(
             name="Клиент",
             contact="@client",
@@ -194,4 +208,5 @@ def test_delivery_success_state():
     assert session.delivery_status == "sent"
     assert session.submitted is True
     assert session.awaiting_confirmation is False
+
 

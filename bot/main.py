@@ -21,6 +21,7 @@ from services.workflow import LeadWorkflow
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import CallbackQueryHandler
+from telegram.error import NetworkError, RetryAfter
 
 from bot.operator_commands import leads_command, lead_command
 
@@ -59,16 +60,13 @@ async def start(
 
     existing = repository.get(user.id)
 
-    if existing is not None and existing.delivery_status in (
-        "sending",
-        "uncertain",
-    ):
-        await update.effective_message.reply_text(
-            "Предыдущая заявка ожидает проверки отправки. "
-            "Создать новую заявку пока нельзя. "
-            "Свяжитесь с оператором."
-        )
-        return
+    if existing is not None and not existing.submitted:
+        if existing.delivery_status != "not_sent":
+            await update.effective_message.reply_text(
+                "Предыдущая заявка ещё обрабатывается. "
+                "Попробуйте немного позже."
+            )
+            return
 
     session = LeadSession(
         user_id=user.id,
@@ -97,22 +95,24 @@ async def cancel(
 
     existing = repository.get(user.id)
 
-    if existing is not None and existing.delivery_status in (
-        "sending",
-        "uncertain",
+    if (
+        existing is not None
+        and existing.delivery_status != "not_sent"
+        and not existing.submitted
     ):
         await update.effective_message.reply_text(
-            "Заявку нельзя отменить, пока результат "
-            "её отправки не проверен оператором."
+            "Заявка уже обрабатывается. "
+            "Отменить её сейчас нельзя."
         )
         return
-
+    
     repository.delete(user.id)
 
     await update.effective_message.reply_text(
         "Текущая заявка отменена. "
         "Чтобы начать заново, отправьте /start."
     )
+
 
 
 async def confirm_lead(
@@ -146,7 +146,6 @@ async def confirm_lead(
             )
             return
 
-        # Кнопка должна принадлежать текущей заявке.
         if (
             query.message is None
             or session.confirmation_message_id is None
@@ -159,24 +158,16 @@ async def confirm_lead(
                 )
             return
 
-        if session.delivery_status in (
-            "sending",
-            "uncertain",
-        ):
+        if session.submitted:
             await query.message.reply_text(
-                "Отправка заявки уже началась, "
-                "но её результат пока не подтверждён. "
-                "Повторная отправка заблокирована. "
-                "Обратитесь к оператору для проверки."
+                "Заявка уже принята."
             )
             return
 
-        if (
-            session.submitted
-            or session.delivery_status == "sent"
-        ):
+        if session.delivery_status != "not_sent":
             await query.message.reply_text(
-                "Заявка уже отправлена."
+                "Заявка уже обрабатывается. "
+                "Повторное подтверждение недоступно."
             )
             return
 
@@ -202,8 +193,6 @@ async def confirm_lead(
         if query.data != "lead_confirm":
             return
 
-        # Согласие фиксируется только после
-        # явного нажатия кнопки пользователем.
         session.lead.consent_to_contact = True
 
         if not workflow.confirm(session):
@@ -214,72 +203,160 @@ async def confirm_lead(
             )
             return
 
-        operator_chat_id = int(
-            os.environ["TELEGRAM_OPERATOR_CHAT_ID"]
-        )
-
-        summary = workflow.format_summary(session.lead)
-
-        # Сначала фиксируем начало отправки в SQLite.
-        workflow.begin_delivery(session)
-        repository.save_delivery(session, "sending")
+        # Сначала сохраняем принятую заявку.
+        session.submitted = True
+        session.awaiting_confirmation = False
 
         try:
-            sent_message = await context.bot.send_message(
-                chat_id=operator_chat_id,
-                text=(
-                    f"Новая заявка на AI-решение\n"
-                    f"ID: {session.lead_id}\n\n"
-                    + summary
-                ),            
+            repository.save_delivery(
+                session, "accepted"
             )
-
         except Exception:
             logger.exception(
-                "Результат отправки заявки неизвестен"
+                "Не удалось сохранить принятую заявку"
             )
-
-            # Исключение не доказывает,
-            # что Telegram не принял сообщение.
-            workflow.delivery_uncertain(session)
-            repository.save_delivery(session, "uncertain")
-
             await query.message.reply_text(
-                "Не удалось подтвердить доставку заявки. "
-                "Повторная отправка заблокирована "
-                "во избежание дубликатов. "
-                "Свяжитесь с оператором."
+                "Не удалось сохранить заявку. "
+                "Попробуйте подтвердить её ещё раз."
             )
             return
 
-        # Telegram подтвердил приём сообщения.
-        workflow.delivery_succeeded(session)
-        repository.save_delivery(
-            session,
-            "sent",
-            telegram_message_id=sent_message.message_id,
-        )
-
-        # Ошибка обновления кнопок не должна
-        # менять уже сохранённый статус sent.
+        # После успешного сохранения заявка принята.
         try:
             await query.edit_message_reply_markup(
                 reply_markup=None
             )
         except Exception:
             logger.exception(
-                "Не удалось убрать кнопки заявки"
+                "Не удалось убрать кнопки"
             )
 
+        summary = workflow.format_summary(session.lead)
+        operator_chat_id = int(
+            os.environ["TELEGRAM_OPERATOR_CHAT_ID"]
+        )
+
+        notification = (
+            "Новая заявка на AI-решение\n"
+            f"ID: {session.lead_id}\n\n"
+            + summary
+        )
+
+        # Подготовка доставки.
+        session.delivery_status = "sending"
+
         try:
-            await query.message.reply_text(
-                "Спасибо! Заявка отправлена. "
-                "С вами свяжутся по указанному контакту."
+            repository.save_delivery(
+                session, "sending"
             )
         except Exception:
             logger.exception(
-                "Не удалось уведомить клиента"
+                "Не удалось зарегистрировать отправку"
             )
+            await query.message.reply_text(
+                "Заявка сохранена и принята. "
+                "Уведомление оператору пока не отправлено."
+            )
+            return
+
+        sent_message = None
+        last_error = None
+
+        for attempt in range(2):
+            if attempt == 1:
+                try:
+                    repository.save_delivery(
+                        session, "retrying"
+                    )
+                except Exception:
+                    logger.exception(
+                        "Не удалось зарегистрировать повтор"
+                    )
+                    break
+
+                await asyncio.sleep(1)
+
+            try:
+                sent_message = await context.bot.send_message(
+                    chat_id=operator_chat_id,
+                    text=notification,
+                )
+                break
+
+            except RetryAfter as exc:
+                last_error = exc
+                logger.warning(
+                    "Telegram ограничил частоту отправки: %s",
+                    exc,
+                )
+                break
+
+            except NetworkError as exc:
+                last_error = exc
+                logger.warning(
+                    "Временная ошибка Telegram, попытка %s",
+                    attempt + 1,
+                    exc_info=True,
+                )
+
+            except Exception as exc:
+                last_error = exc
+                logger.exception(
+                    "Ошибка отправки уведомления"
+                )
+                break
+
+        if sent_message is not None:
+            session.delivery_status = "sent"
+
+            try:
+                repository.save_delivery(
+                    session,
+                    "sent",
+                    telegram_message_id=sent_message.message_id,
+                )
+            except Exception:
+                logger.exception(
+                    "Telegram принял сообщение, "
+                    "но не удалось сохранить результат"
+                )
+                await query.message.reply_text(
+                    "Заявка принята. "
+                    "Результат уведомления оператора "
+                    "пока не удалось зафиксировать."
+                )
+                return
+
+            await query.message.reply_text(
+                "Спасибо! Заявка принята и "
+                "передана оператору. "
+                "С вами свяжутся по указанному контакту."
+            )
+            return
+
+        session.delivery_status = "uncertain"
+
+        try:
+            repository.save_delivery(
+                session, "uncertain"
+            )
+        except Exception:
+            logger.exception(
+                "Не удалось сохранить ошибку доставки"
+            )
+
+        logger.warning(
+            "Уведомление не подтверждено для заявки %s: %s",
+            session.lead_id,
+            type(last_error).__name__
+            if last_error else "ошибка регистрации повтора",
+        )
+
+        await query.message.reply_text(
+            "Ваша заявка принята и сохранена. "
+            "Уведомление оператору пока не подтверждено. "
+            "Повторно оформлять заявку не нужно."
+        )
 
 
 async def handle_message(
