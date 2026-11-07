@@ -28,6 +28,7 @@ from bot.operator_commands import (
     lead_command,
     pending_command,
     retry_command,
+    mark_sent_command,
 )
 
 logging.basicConfig(
@@ -502,6 +503,10 @@ def main() -> None:
 
     application.add_handler(
         CommandHandler("retry", retry_command)
+    )
+
+    application.add_handler(
+        CommandHandler("mark_sent", mark_sent_command)
     )
 
     application.add_handler(

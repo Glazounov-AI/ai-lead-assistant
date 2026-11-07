@@ -326,3 +326,56 @@ async def retry_command(
         f"ID: {lead_id}"
     )
 
+
+async def mark_sent_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not await authorize(update):
+        return
+
+    if len(context.args or []) != 1:
+        await update.effective_message.reply_text(
+            "Использование: /mark_sent UUID"
+        )
+        return
+
+    lead_id = resolve_lead_id(
+        get_repository(),
+        context.args[0],
+    )
+
+    if lead_id is None:
+        await update.effective_message.reply_text(
+            "Некорректный UUID."
+        )
+        return
+
+    try:
+        repository = get_repository()
+        result = repository.mark_sent_manually(
+            lead_id,
+            update.effective_user.id,
+        )
+    except Exception:
+        logger.exception(
+            "Ошибка ручного подтверждения заявки %s",
+            lead_id,
+        )
+        await update.effective_message.reply_text(
+            "Не удалось сохранить подтверждение доставки."
+        )
+        return
+
+    if not result:
+        await update.effective_message.reply_text(
+            "Заявка не найдена или её статус "
+            "не позволяет ручное подтверждение. "
+            "Проверьте /lead UUID."
+        )
+        return
+
+    await update.effective_message.reply_text(
+        "Доставка подтверждена оператором.\n"
+        f"ID: {lead_id}"
+    )

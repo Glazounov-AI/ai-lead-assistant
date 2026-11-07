@@ -258,3 +258,349 @@ def test_retry_sqlite_failure_after_telegram_success(
     assert "sent" not in statuses
 
 
+def test_manual_mark_sent(monkeypatch, tmp_path):
+    path, leads, session = prepare_lead(
+        tmp_path,
+        status="sending",
+    )
+
+    operator_id = 999999
+
+    result = leads.mark_sent_manually(
+        session.lead_id,
+        operator_id,
+    )
+
+    assert result is True
+
+    # Статус заявки изменился.
+    saved = leads.get(session.lead_id)
+
+    assert saved is not None
+    assert saved.submitted is True
+    assert saved.delivery_status == "sent"
+
+    # Повторная отправка запрещена.
+    assert leads.claim_retry(session.lead_id) is None
+
+    # Проверяем журнал доставки и действий оператора.
+    with sqlite3.connect(path) as db:
+        attempt = db.execute(
+            """
+            SELECT status, telegram_message_id
+            FROM delivery_attempts
+            WHERE lead_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (session.lead_id,),
+        ).fetchone()
+
+        action = db.execute(
+            """
+            SELECT operator_id, action
+            FROM operator_actions
+            WHERE lead_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (session.lead_id,),
+        ).fetchone()
+
+    assert attempt == ("manually_confirmed", None)
+    assert action == (
+        operator_id,
+        "manual_mark_sent",
+    )
+
+
+def test_manual_mark_sent_rollback_on_sqlite_failure(tmp_path):
+    path, leads, session = prepare_lead(
+        tmp_path,
+        status="sending",
+    )
+
+    # Искусственно запрещаем запись в журнал оператора.
+    with sqlite3.connect(path) as db:
+        db.execute(
+            """
+            CREATE TRIGGER fail_operator_action
+            BEFORE INSERT ON operator_actions
+            BEGIN
+                SELECT RAISE(
+                    ABORT,
+                    'simulated SQLite failure'
+                );
+            END
+            """
+        )
+
+    # Метод должен завершиться ошибкой SQLite.
+    import pytest
+
+    with pytest.raises(
+        sqlite3.IntegrityError,
+        match="simulated SQLite failure",
+    ):
+        leads.mark_sent_manually(
+            session.lead_id,
+            999999,
+        )
+
+    # Проверяем, что статус не изменился.
+    saved = leads.get(session.lead_id)
+
+    assert saved is not None
+    assert saved.delivery_status == "sending"
+
+    # Проверяем отсутствие частично записанных событий.
+    with sqlite3.connect(path) as db:
+        attempts = db.execute(
+            """
+            SELECT COUNT(*)
+            FROM delivery_attempts
+            WHERE lead_id = ?
+              AND status = 'manually_confirmed'
+            """,
+            (session.lead_id,),
+        ).fetchone()[0]
+
+        actions = db.execute(
+            """
+            SELECT COUNT(*)
+            FROM operator_actions
+            WHERE lead_id = ?
+              AND action = 'manual_mark_sent'
+            """,
+            (session.lead_id,),
+        ).fetchone()[0]
+
+    assert attempts == 0
+    assert actions == 0
+
+
+def test_mark_sent_command_success(monkeypatch, tmp_path):
+    path, leads, session = prepare_lead(
+        tmp_path,
+        status="sending",
+    )
+
+    commands, update, context = make_command(
+        monkeypatch,
+        path,
+        session.lead_id,
+    )
+
+    asyncio.run(
+        commands.mark_sent_command(update, context)
+    )
+
+    # Заявка подтверждена вручную.
+    saved = leads.get(session.lead_id)
+
+    assert saved is not None
+    assert saved.delivery_status == "sent"
+
+    # Telegram не должен отправлять новое уведомление.
+    context.bot.send_message.assert_not_awaited()
+
+    # Оператор получает подтверждение.
+    update.effective_message.reply_text.assert_awaited_once_with(
+        "Доставка подтверждена оператором.\n"
+        f"ID: {session.lead_id}"
+    )
+
+    # Действие оператора записано в журнал.
+    with sqlite3.connect(path) as db:
+        action = db.execute(
+            """
+            SELECT operator_id, action
+            FROM operator_actions
+            WHERE lead_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (session.lead_id,),
+        ).fetchone()
+
+    assert action == (999999, "manual_mark_sent")
+
+
+def test_mark_sent_command_rejects_unauthorized_user(
+    monkeypatch, tmp_path
+):
+    path, leads, session = prepare_lead(
+        tmp_path,
+        status="sending",
+    )
+
+    commands, update, context = make_command(
+        monkeypatch,
+        path,
+        session.lead_id,
+    )
+
+    # Команду пытается выполнить другой пользователь.
+    update.effective_user.id = 123456
+
+    asyncio.run(
+        commands.mark_sent_command(update, context)
+    )
+
+    # Статус заявки не изменился.
+    saved = leads.get(session.lead_id)
+
+    assert saved is not None
+    assert saved.delivery_status == "sending"
+
+    # Уведомление оператору не отправлялось.
+    context.bot.send_message.assert_not_awaited()
+
+    # Постороннему пользователю отказано.
+    update.effective_message.reply_text.assert_awaited_once_with(
+        "Команда недоступна."
+    )
+
+    # Действие оператора не зарегистрировано.
+    with sqlite3.connect(path) as db:
+        count = db.execute(
+            """
+            SELECT COUNT(*)
+            FROM operator_actions
+            WHERE lead_id = ?
+              AND action = 'manual_mark_sent'
+            """,
+            (session.lead_id,),
+        ).fetchone()[0]
+
+    assert count == 0
+
+
+def test_mark_sent_command_already_sent(monkeypatch, tmp_path):
+    path, leads, session = prepare_lead(
+        tmp_path,
+        status="sent",
+    )
+
+    commands, update, context = make_command(
+        monkeypatch,
+        path,
+        session.lead_id,
+    )
+
+    asyncio.run(
+        commands.mark_sent_command(update, context)
+    )
+
+    saved = leads.get(session.lead_id)
+
+    assert saved is not None
+    assert saved.delivery_status == "sent"
+
+    # Повторной отправки сообщения нет.
+    context.bot.send_message.assert_not_awaited()
+
+    # Оператор получает отказ.
+    update.effective_message.reply_text.assert_awaited_once_with(
+        "Заявка не найдена или её статус "
+        "не позволяет ручное подтверждение. "
+        "Проверьте /lead UUID."
+    )
+
+    # Ручное подтверждение не записано.
+    with sqlite3.connect(path) as db:
+        attempts = db.execute(
+            """
+            SELECT COUNT(*)
+            FROM delivery_attempts
+            WHERE lead_id = ?
+              AND status = 'manually_confirmed'
+            """,
+            (session.lead_id,),
+        ).fetchone()[0]
+
+        actions = db.execute(
+            """
+            SELECT COUNT(*)
+            FROM operator_actions
+            WHERE lead_id = ?
+              AND action = 'manual_mark_sent'
+            """,
+            (session.lead_id,),
+        ).fetchone()[0]
+
+    assert attempts == 0
+    assert actions == 0
+
+
+def test_mark_sent_command_sqlite_failure(monkeypatch, tmp_path):
+    path, leads, session = prepare_lead(
+        tmp_path,
+        status="sending",
+    )
+
+    commands, update, context = make_command(
+        monkeypatch,
+        path,
+        session.lead_id,
+    )
+
+    # Имитируем ошибку SQLite при записи действия оператора.
+    with sqlite3.connect(path) as db:
+        db.execute(
+            """
+            CREATE TRIGGER fail_manual_confirmation
+            BEFORE INSERT ON operator_actions
+            BEGIN
+                SELECT RAISE(
+                    ABORT,
+                    'simulated SQLite failure'
+                );
+            END
+            """
+        )
+
+    asyncio.run(
+        commands.mark_sent_command(update, context)
+    )
+
+    # Статус должен остаться прежним.
+    saved = leads.get(session.lead_id)
+
+    assert saved is not None
+    assert saved.delivery_status == "sending"
+
+    # Оператор получает сообщение об ошибке.
+    update.effective_message.reply_text.assert_awaited_once_with(
+        "Не удалось сохранить подтверждение доставки."
+    )
+
+    # Новое Telegram-уведомление не отправлялось.
+    context.bot.send_message.assert_not_awaited()
+
+    # Частично записанных событий быть не должно.
+    with sqlite3.connect(path) as db:
+        attempts = db.execute(
+            """
+            SELECT COUNT(*)
+            FROM delivery_attempts
+            WHERE lead_id = ?
+              AND status = 'manually_confirmed'
+            """,
+            (session.lead_id,),
+        ).fetchone()[0]
+
+        actions = db.execute(
+            """
+            SELECT COUNT(*)
+            FROM operator_actions
+            WHERE lead_id = ?
+              AND action = 'manual_mark_sent'
+            """,
+            (session.lead_id,),
+        ).fetchone()[0]
+
+    assert attempts == 0
+    assert actions == 0
+
+

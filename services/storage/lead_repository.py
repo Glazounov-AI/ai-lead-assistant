@@ -364,3 +364,110 @@ class LeadRepository:
                 ),
             )
 
+    def mark_sent_manually(
+        self,
+        lead_id: str,
+        operator_id: int,
+    ) -> bool:
+        """Ручное подтверждение доставки заявки."""
+
+        now = utc_now()
+
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+
+            row = db.execute(
+                """
+                SELECT session_json, delivery_status
+                FROM leads
+                WHERE lead_id = ?
+                """,
+                (lead_id,),
+            ).fetchone()
+
+            if row is None:
+                return False
+
+            if row["delivery_status"] != "sending":
+                return False
+
+            session = LeadSession.model_validate_json(
+                row["session_json"]
+            )
+
+            if not session.submitted:
+                return False
+
+            session.delivery_status = "sent"
+            session_json = session.model_dump_json()
+
+            db.execute(
+                """
+                UPDATE leads
+                SET session_json = ?,
+                    delivery_status = 'sent',
+                    updated_at = ?
+                WHERE lead_id = ?
+                """,
+                (session_json, now, lead_id),
+            )
+
+            # Синхронизируем активную сессию,
+            # только если это та же заявка.
+            current = db.execute(
+                """
+                SELECT session_json
+                FROM sessions
+                WHERE user_id = ?
+                """,
+                (session.user_id,),
+            ).fetchone()
+
+            if current is not None:
+                active = LeadSession.model_validate_json(
+                    current["session_json"]
+                )
+
+                if active.lead_id == lead_id:
+                    db.execute(
+                        """
+                        UPDATE sessions
+                        SET session_json = ?
+                        WHERE user_id = ?
+                        """,
+                        (
+                            session_json,
+                            session.user_id,
+                        ),
+                    )
+
+            # Событие ручного подтверждения.
+            # message_id не выдумываем.
+            db.execute(
+                """
+                INSERT INTO delivery_attempts (
+                    lead_id,
+                    status,
+                    telegram_message_id,
+                    created_at
+                )
+                VALUES (?, 'manually_confirmed', NULL, ?)
+                """,
+                (lead_id, now),
+            )
+
+            # Аудит действия оператора.
+            db.execute(
+                """
+                INSERT INTO operator_actions (
+                    lead_id,
+                    operator_id,
+                    action,
+                    created_at
+                )
+                VALUES (?, ?, 'manual_mark_sent', ?)
+                """,
+                (lead_id, operator_id, now),
+            )
+
+        return True
