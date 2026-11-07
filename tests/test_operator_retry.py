@@ -135,3 +135,126 @@ def test_claim_retry_is_atomic(tmp_path):
     assert second is None
     assert leads.get(session.lead_id).delivery_status == "sending"
 
+
+def test_manual_retry_telegram_failure(monkeypatch, tmp_path):
+    from telegram.error import NetworkError
+
+    path, leads, session = prepare_lead(tmp_path)
+
+    commands, update, context = make_command(
+        monkeypatch,
+        path,
+        session.lead_id,
+        side_effect=NetworkError("temporary failure"),
+    )
+
+    asyncio.run(
+        commands.retry_command(update, context)
+    )
+
+    # Попытка отправки была ровно одна.
+    assert context.bot.send_message.await_count == 1
+
+    # Заявка не потеряна и остаётся доступной для повтора.
+    saved = leads.get(session.lead_id)
+
+    assert saved is not None
+    assert saved.submitted is True
+    assert saved.delivery_status == "uncertain"
+
+    # Заявка присутствует в списке неподтверждённых.
+    pending_ids = {
+        item.lead_id for item in leads.list_pending()
+    }
+    assert session.lead_id in pending_ids
+
+    # Проверяем журнал доставки.
+    with sqlite3.connect(path) as db:
+        statuses = [
+            row[0]
+            for row in db.execute(
+                """
+                SELECT status
+                FROM delivery_attempts
+                WHERE lead_id = ?
+                ORDER BY id
+                """,
+                (session.lead_id,),
+            )
+        ]
+
+    assert statuses[-2:] == ["retrying", "uncertain"]
+
+    update.effective_message.reply_text.assert_awaited_once_with(
+        "Доставка не подтверждена. "
+        "Заявка сохранена в реестре."
+    )
+
+
+def test_retry_sqlite_failure_after_telegram_success(
+    monkeypatch, tmp_path
+):
+    path, leads, session = prepare_lead(tmp_path)
+
+    commands, update, context = make_command(
+        monkeypatch,
+        path,
+        session.lead_id,
+    )
+
+    # Telegram отправит сообщение успешно,
+    # но запись результата в SQLite завершится ошибкой.
+    def failed_complete_retry(*args, **kwargs):
+        raise sqlite3.OperationalError(
+            "database is locked"
+        )
+
+    monkeypatch.setattr(
+        LeadRepository,
+        "complete_retry",
+        failed_complete_retry,
+    )
+
+    asyncio.run(
+        commands.retry_command(update, context)
+    )
+
+    # Telegram получил только одно уведомление.
+    context.bot.send_message.assert_awaited_once()
+
+    # Успешная доставка не зафиксирована в SQLite.
+    saved = leads.get(session.lead_id)
+
+    assert saved is not None
+    assert saved.submitted is True
+    assert saved.delivery_status == "sending"
+
+    # Оператор получает предупреждение.
+    update.effective_message.reply_text.assert_awaited_once_with(
+        "Telegram принял уведомление, но сохранить "
+        "подтверждение не удалось. "
+        "Проверьте заявку вручную."
+    )
+
+    # Повторная отправка заблокирована.
+    assert leads.claim_retry(session.lead_id) is None
+
+    # Успешная доставка не записана в журнал.
+    with sqlite3.connect(path) as db:
+        statuses = [
+            row[0]
+            for row in db.execute(
+                """
+                SELECT status
+                FROM delivery_attempts
+                WHERE lead_id = ?
+                ORDER BY id
+                """,
+                (session.lead_id,),
+            )
+        ]
+
+    assert statuses[-1] == "retrying"
+    assert "sent" not in statuses
+
+
