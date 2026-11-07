@@ -149,3 +149,218 @@ class LeadRepository:
                 action,
                 utc_now(),
             ))
+
+
+    def list_pending(self, limit: int = 20) -> list[LeadSession]:
+        """Принятые заявки без подтверждённой доставки."""
+        with self._connect() as db:
+            rows = db.execute(
+                """
+                SELECT session_json
+                FROM leads
+                WHERE delivery_status IN (
+                    'not_sent', 'sending', 'uncertain'
+                )
+                ORDER BY created_at ASC, rowid ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+        return [
+            LeadSession.model_validate_json(row["session_json"])
+            for row in rows
+        ]
+
+    def claim_retry(self, lead_id: str) -> LeadSession | None:
+        """Атомарно зарезервировать заявку для повтора."""
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+
+            row = db.execute(
+                """
+                SELECT session_json, delivery_status
+                FROM leads
+                WHERE lead_id = ?
+                """,
+                (lead_id,),
+            ).fetchone()
+
+            if row is None:
+                return None
+
+            if row["delivery_status"] not in (
+                "not_sent", "uncertain"
+            ):
+                return None
+
+            session = LeadSession.model_validate_json(
+                row["session_json"]
+            )
+
+            if not session.submitted:
+                return None
+
+            session.delivery_status = "sending"
+            now = utc_now()
+
+            db.execute(
+                """
+                UPDATE leads
+                SET session_json = ?,
+                    delivery_status = 'sending',
+                    updated_at = ?
+                WHERE lead_id = ?
+                """,
+                (
+                    session.model_dump_json(),
+                    now,
+                    lead_id,
+                ),
+            )
+
+            # Обновляем активную сессию только если она
+            # всё ещё относится к этой заявке.
+            current = db.execute(
+                """
+                SELECT session_json
+                FROM sessions
+                WHERE user_id = ?
+                """,
+                (session.user_id,),
+            ).fetchone()
+
+            if current is not None:
+                active = LeadSession.model_validate_json(
+                    current["session_json"]
+                )
+
+                if active.lead_id == lead_id:
+                    db.execute(
+                        """
+                        UPDATE sessions
+                        SET session_json = ?
+                        WHERE user_id = ?
+                        """,
+                        (
+                            session.model_dump_json(),
+                            session.user_id,
+                        ),
+                    )
+
+            db.execute(
+                """
+                INSERT INTO delivery_attempts (
+                    lead_id, status, telegram_message_id,
+                    created_at
+                )
+                VALUES (?, 'retrying', NULL, ?)
+                """,
+                (lead_id, now),
+            )
+
+            return session
+
+    def complete_retry(
+        self,
+        session: LeadSession,
+        status: str,
+        telegram_message_id: int | None = None,
+    ) -> None:
+        """Сохранить результат ручной отправки."""
+        if status not in ("sent", "uncertain"):
+            raise ValueError("Недопустимый статус доставки")
+
+        if (
+            status == "sent"
+            and telegram_message_id is None
+        ):
+            raise ValueError(
+                "Для успешной доставки нужен message_id"
+            )
+
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+
+            row = db.execute(
+                """
+                SELECT session_json, delivery_status
+                FROM leads
+                WHERE lead_id = ?
+                """,
+                (session.lead_id,),
+            ).fetchone()
+
+            if row is None:
+                raise ValueError("Заявка не найдена")
+
+            if row["delivery_status"] != "sending":
+                raise ValueError(
+                    "Заявка не находится в состоянии отправки"
+                )
+
+            stored = LeadSession.model_validate_json(
+                row["session_json"]
+            )
+            stored.delivery_status = status
+            now = utc_now()
+
+            db.execute(
+                """
+                UPDATE leads
+                SET session_json = ?,
+                    delivery_status = ?,
+                    updated_at = ?
+                WHERE lead_id = ?
+                """,
+                (
+                    stored.model_dump_json(),
+                    status,
+                    now,
+                    session.lead_id,
+                ),
+            )
+
+            current = db.execute(
+                """
+                SELECT session_json
+                FROM sessions
+                WHERE user_id = ?
+                """,
+                (stored.user_id,),
+            ).fetchone()
+
+            if current is not None:
+                active = LeadSession.model_validate_json(
+                    current["session_json"]
+                )
+
+                if active.lead_id == stored.lead_id:
+                    db.execute(
+                        """
+                        UPDATE sessions
+                        SET session_json = ?
+                        WHERE user_id = ?
+                        """,
+                        (
+                            stored.model_dump_json(),
+                            stored.user_id,
+                        ),
+                    )
+
+            db.execute(
+                """
+                INSERT INTO delivery_attempts (
+                    lead_id, status,
+                    telegram_message_id, created_at
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    stored.lead_id,
+                    status,
+                    telegram_message_id,
+                    now,
+                ),
+            )
+

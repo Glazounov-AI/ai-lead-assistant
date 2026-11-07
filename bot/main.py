@@ -23,13 +23,20 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import CallbackQueryHandler
 from telegram.error import NetworkError, RetryAfter
 
-from bot.operator_commands import leads_command, lead_command
+from bot.operator_commands import (
+    leads_command,
+    lead_command,
+    pending_command,
+    retry_command,
+)
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 repository = SessionRepository(
     os.getenv("DATABASE_PATH", "data/sessions.db")
@@ -487,6 +494,14 @@ def main() -> None:
 
     application.add_handler(
         CommandHandler("lead", lead_command)
+    )
+
+    application.add_handler(
+        CommandHandler("pending", pending_command)
+    )
+
+    application.add_handler(
+        CommandHandler("retry", retry_command)
     )
 
     application.add_handler(
