@@ -780,6 +780,371 @@ def test_manual_reset_delivery_rollback(tmp_path):
         assert count == 0
 
 
+def test_delivery_reset_confirmation_success(tmp_path):
+    path, leads, session = prepare_lead(
+        tmp_path,
+        status="sending",
+    )
+    operator_id = 999999
+
+    token = leads.create_delivery_reset_confirmation(
+        session.lead_id,
+        operator_id,
+    )
+
+    assert token is not None
+    assert len(f"reset:yes:{token}".encode("utf-8")) <= 64
+
+    result = leads.confirm_delivery_reset(token, operator_id)
+
+    assert result == "ok"
+
+    saved = leads.get(session.lead_id)
+
+    assert saved is not None
+    assert saved.delivery_status == "uncertain"
+
+    with sqlite3.connect(path) as db:
+        attempt = db.execute(
+            """
+            SELECT status, telegram_message_id
+            FROM delivery_attempts
+            WHERE lead_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (session.lead_id,),
+        ).fetchone()
+
+        action = db.execute(
+            """
+            SELECT operator_id, action
+            FROM operator_actions
+            WHERE lead_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (session.lead_id,),
+        ).fetchone()
+
+        confirmation = db.execute(
+            """
+            SELECT used_at, cancelled_at
+            FROM delivery_reset_confirmations
+            WHERE token = ?
+            """,
+            (token,),
+        ).fetchone()
+
+    assert attempt == ("manually_reset", None)
+    assert action == (operator_id, "manual_reset_delivery")
+    assert confirmation is not None
+    assert confirmation[0] is not None
+    assert confirmation[1] is None
+
+
+def test_delivery_reset_confirmation_cancel(tmp_path):
+    path, leads, session = prepare_lead(
+        tmp_path,
+        status="sending",
+    )
+    operator_id = 999999
+
+    token = leads.create_delivery_reset_confirmation(
+        session.lead_id,
+        operator_id,
+    )
+
+    assert token is not None
+    assert leads.cancel_delivery_reset_confirmation(
+        token,
+        operator_id,
+    ) is True
+    assert leads.cancel_delivery_reset_confirmation(
+        token,
+        operator_id,
+    ) is False
+
+    saved = leads.get(session.lead_id)
+
+    assert saved is not None
+    assert saved.delivery_status == "sending"
+    assert leads.confirm_delivery_reset(token, operator_id) == (
+        "consumed"
+    )
+
+    with sqlite3.connect(path) as db:
+        attempts = db.execute(
+            """
+            SELECT COUNT(*)
+            FROM delivery_attempts
+            WHERE lead_id = ?
+              AND status = 'manually_reset'
+            """,
+            (session.lead_id,),
+        ).fetchone()[0]
+
+        actions = db.execute(
+            """
+            SELECT COUNT(*)
+            FROM operator_actions
+            WHERE lead_id = ?
+              AND action = 'manual_reset_delivery'
+            """,
+            (session.lead_id,),
+        ).fetchone()[0]
+
+        cancelled_at = db.execute(
+            """
+            SELECT cancelled_at
+            FROM delivery_reset_confirmations
+            WHERE token = ?
+            """,
+            (token,),
+        ).fetchone()[0]
+
+    assert attempts == 0
+    assert actions == 0
+    assert cancelled_at is not None
+
+
+def test_delivery_reset_confirmation_expired(tmp_path):
+    path, leads, session = prepare_lead(
+        tmp_path,
+        status="sending",
+    )
+    operator_id = 999999
+
+    token = leads.create_delivery_reset_confirmation(
+        session.lead_id,
+        operator_id,
+    )
+    assert token is not None
+
+    with sqlite3.connect(path) as db:
+        db.execute(
+            """
+            UPDATE delivery_reset_confirmations
+            SET expires_at = ?
+            WHERE token = ?
+            """,
+            ("2000-01-01T00:00:00+00:00", token),
+        )
+
+    assert leads.confirm_delivery_reset(token, operator_id) == (
+        "expired"
+    )
+
+    saved = leads.get(session.lead_id)
+
+    assert saved is not None
+    assert saved.delivery_status == "sending"
+
+    with sqlite3.connect(path) as db:
+        attempts = db.execute(
+            """
+            SELECT COUNT(*)
+            FROM delivery_attempts
+            WHERE lead_id = ?
+              AND status = 'manually_reset'
+            """,
+            (session.lead_id,),
+        ).fetchone()[0]
+
+    assert attempts == 0
+
+
+def test_delivery_reset_confirmation_double_confirm(tmp_path):
+    _, leads, session = prepare_lead(
+        tmp_path,
+        status="sending",
+    )
+    operator_id = 999999
+
+    token = leads.create_delivery_reset_confirmation(
+        session.lead_id,
+        operator_id,
+    )
+    assert token is not None
+
+    assert leads.confirm_delivery_reset(token, operator_id) == "ok"
+    assert leads.confirm_delivery_reset(token, operator_id) == (
+        "consumed"
+    )
+
+    saved = leads.get(session.lead_id)
+
+    assert saved is not None
+    assert saved.delivery_status == "uncertain"
+
+
+def test_delivery_reset_confirmation_rejects_stale_cycle(
+    tmp_path,
+):
+    path, leads, session = prepare_lead(
+        tmp_path,
+        status="sending",
+    )
+    operator_id = 999999
+
+    token = leads.create_delivery_reset_confirmation(
+        session.lead_id,
+        operator_id,
+    )
+    assert token is not None
+
+    # Новый цикл без использования старого токена.
+    assert leads.reset_delivery_manually(
+        session.lead_id,
+        operator_id,
+    ) is True
+    claimed = leads.claim_retry(session.lead_id)
+    assert claimed is not None
+    assert claimed.delivery_status == "sending"
+
+    assert leads.confirm_delivery_reset(token, operator_id) == (
+        "stale"
+    )
+
+    saved = leads.get(session.lead_id)
+
+    assert saved is not None
+    assert saved.delivery_status == "sending"
+
+    with sqlite3.connect(path) as db:
+        resets = db.execute(
+            """
+            SELECT COUNT(*)
+            FROM delivery_attempts
+            WHERE lead_id = ?
+              AND status = 'manually_reset'
+            """,
+            (session.lead_id,),
+        ).fetchone()[0]
+
+        # Один сброс от reset_delivery_manually, без второго.
+        assert resets == 1
+
+
+def test_delivery_reset_confirmation_wrong_operator(tmp_path):
+    _, leads, session = prepare_lead(
+        tmp_path,
+        status="sending",
+    )
+
+    token = leads.create_delivery_reset_confirmation(
+        session.lead_id,
+        999999,
+    )
+    assert token is not None
+
+    assert leads.confirm_delivery_reset(token, 123456) == "invalid"
+    assert leads.cancel_delivery_reset_confirmation(
+        token,
+        123456,
+    ) is False
+
+    saved = leads.get(session.lead_id)
+
+    assert saved is not None
+    assert saved.delivery_status == "sending"
+
+
+def test_delivery_reset_confirmation_invalid_token(tmp_path):
+    _, leads, session = prepare_lead(
+        tmp_path,
+        status="sending",
+    )
+
+    assert leads.confirm_delivery_reset(
+        "not-a-real-token",
+        999999,
+    ) == "invalid"
+    assert leads.cancel_delivery_reset_confirmation(
+        "not-a-real-token",
+        999999,
+    ) is False
+
+    saved = leads.get(session.lead_id)
+
+    assert saved is not None
+    assert saved.delivery_status == "sending"
+
+
+def test_delivery_reset_confirmation_rollback(tmp_path):
+    path, leads, session = prepare_lead(
+        tmp_path,
+        status="sending",
+    )
+    operator_id = 999999
+
+    token = leads.create_delivery_reset_confirmation(
+        session.lead_id,
+        operator_id,
+    )
+    assert token is not None
+
+    with sqlite3.connect(path) as db:
+        db.execute(
+            """
+            CREATE TRIGGER fail_reset_confirm_audit
+            BEFORE INSERT ON operator_actions
+            WHEN NEW.action = 'manual_reset_delivery'
+            BEGIN
+                SELECT RAISE(ABORT, 'audit write failed');
+            END;
+            """
+        )
+
+    with pytest.raises(
+        sqlite3.DatabaseError,
+        match="audit write failed",
+    ):
+        leads.confirm_delivery_reset(token, operator_id)
+
+    saved = leads.get(session.lead_id)
+
+    assert saved is not None
+    assert saved.delivery_status == "sending"
+
+    with sqlite3.connect(path) as db:
+        attempts = db.execute(
+            """
+            SELECT COUNT(*)
+            FROM delivery_attempts
+            WHERE lead_id = ?
+              AND status = 'manually_reset'
+            """,
+            (session.lead_id,),
+        ).fetchone()[0]
+
+        used_at = db.execute(
+            """
+            SELECT used_at
+            FROM delivery_reset_confirmations
+            WHERE token = ?
+            """,
+            (token,),
+        ).fetchone()[0]
+
+        active = db.execute(
+            """
+            SELECT session_json
+            FROM sessions
+            WHERE user_id = ?
+            """,
+            (session.user_id,),
+        ).fetchone()
+
+    assert attempts == 0
+    assert used_at is None
+    assert active is not None
+    assert (
+        LeadSession.model_validate_json(active[0]).delivery_status
+        == "sending"
+    )
+
+
 def test_reset_delivery_callback_cancel(
     tmp_path,
     monkeypatch,
@@ -801,8 +1166,14 @@ def test_reset_delivery_callback_cancel(
         "999999",
     )
 
+    token = leads.create_delivery_reset_confirmation(
+        session.lead_id,
+        999999,
+    )
+    assert token is not None
+
     query = SimpleNamespace(
-        data=f"reset:no:{session.lead_id}",
+        data=f"reset:no:{token}",
         answer=AsyncMock(),
         edit_message_text=AsyncMock(),
     )
@@ -843,7 +1214,17 @@ def test_reset_delivery_callback_cancel(
             (session.lead_id,),
         ).fetchone()[0]
 
+        cancelled_at = db.execute(
+            """
+            SELECT cancelled_at
+            FROM delivery_reset_confirmations
+            WHERE token = ?
+            """,
+            (token,),
+        ).fetchone()[0]
+
     assert count == 0
+    assert cancelled_at is not None
 
 
 def test_reset_delivery_callback_confirm(
@@ -867,8 +1248,14 @@ def test_reset_delivery_callback_confirm(
         "999999",
     )
 
+    token = leads.create_delivery_reset_confirmation(
+        session.lead_id,
+        999999,
+    )
+    assert token is not None
+
     query = SimpleNamespace(
-        data=f"reset:yes:{session.lead_id}",
+        data=f"reset:yes:{token}",
         answer=AsyncMock(),
         edit_message_text=AsyncMock(),
     )
@@ -950,8 +1337,14 @@ def test_reset_delivery_callback_double_confirm(
         "999999",
     )
 
+    token = leads.create_delivery_reset_confirmation(
+        session.lead_id,
+        999999,
+    )
+    assert token is not None
+
     query = SimpleNamespace(
-        data=f"reset:yes:{session.lead_id}",
+        data=f"reset:yes:{token}",
         answer=AsyncMock(),
         edit_message_text=AsyncMock(),
     )
@@ -1028,8 +1421,14 @@ def test_reset_delivery_callback_unauthorized(
         "999999",
     )
 
+    token = leads.create_delivery_reset_confirmation(
+        session.lead_id,
+        999999,
+    )
+    assert token is not None
+
     query = SimpleNamespace(
-        data=f"reset:yes:{session.lead_id}",
+        data=f"reset:yes:{token}",
         answer=AsyncMock(),
         edit_message_text=AsyncMock(),
     )
@@ -1075,5 +1474,326 @@ def test_reset_delivery_callback_unauthorized(
         ).fetchone()[0]
 
     assert count == 0
+
+
+def _create_legacy_sqlite_without_cycle_id(path: str) -> dict:
+    """Старая производственная схема без delivery_cycle_id."""
+    from core.schemas import LeadSession, ProjectLead
+
+    session = LeadSession(
+        user_id=123,
+        chat_id=123,
+        submitted=True,
+        delivery_status="sending",
+        lead=ProjectLead(
+            name="Legacy Client",
+            contact="@legacy",
+            business_task="Сохранить заявку",
+            consent_to_contact=True,
+        ),
+    )
+    session_json = session.model_dump_json()
+    created_at = "2024-01-01T00:00:00+00:00"
+
+    with sqlite3.connect(path) as db:
+        db.execute(
+            """
+            CREATE TABLE sessions (
+                user_id INTEGER PRIMARY KEY,
+                session_json TEXT NOT NULL
+            )
+            """
+        )
+        db.execute(
+            """
+            CREATE TABLE leads (
+                lead_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                session_json TEXT NOT NULL,
+                delivery_status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        db.execute(
+            """
+            CREATE TABLE delivery_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lead_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                telegram_message_id INTEGER,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (lead_id) REFERENCES leads(lead_id)
+            )
+            """
+        )
+        db.execute(
+            """
+            CREATE TABLE operator_actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lead_id TEXT NOT NULL,
+                operator_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (lead_id) REFERENCES leads(lead_id)
+            )
+            """
+        )
+        db.execute(
+            """
+            INSERT INTO sessions (user_id, session_json)
+            VALUES (?, ?)
+            """,
+            (session.user_id, session_json),
+        )
+        db.execute(
+            """
+            INSERT INTO leads (
+                lead_id, user_id, session_json,
+                delivery_status, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session.lead_id,
+                session.user_id,
+                session_json,
+                "sending",
+                created_at,
+                created_at,
+            ),
+        )
+        db.execute(
+            """
+            INSERT INTO delivery_attempts (
+                lead_id, status, telegram_message_id, created_at
+            )
+            VALUES (?, 'sending', NULL, ?)
+            """,
+            (session.lead_id, created_at),
+        )
+        db.execute(
+            """
+            INSERT INTO operator_actions (
+                lead_id, operator_id, action, created_at
+            )
+            VALUES (?, 999999, 'reviewed', ?)
+            """,
+            (session.lead_id, created_at),
+        )
+
+    return {
+        "lead_id": session.lead_id,
+        "user_id": session.user_id,
+        "session_json": session_json,
+        "created_at": created_at,
+    }
+
+
+def _leads_columns(path: str) -> set[str]:
+    with sqlite3.connect(path) as db:
+        return {
+            row[1]
+            for row in db.execute("PRAGMA table_info(leads)")
+        }
+
+
+def test_reset_delivery_handlers_registered(
+    monkeypatch,
+    tmp_path,
+):
+    import importlib
+    from types import SimpleNamespace
+
+    from telegram.ext import (
+        CallbackQueryHandler,
+        CommandHandler,
+    )
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:TEST")
+    monkeypatch.setenv(
+        "DATABASE_PATH",
+        str(tmp_path / "handlers.db"),
+    )
+
+    import bot.main as bot_main
+
+    bot_main = importlib.reload(bot_main)
+
+    handlers = []
+    application = SimpleNamespace(
+        add_handler=lambda handler: handlers.append(handler),
+        run_polling=lambda: None,
+    )
+    builder = SimpleNamespace(
+        token=lambda *args, **kwargs: builder,
+        concurrent_updates=lambda *args, **kwargs: builder,
+        build=lambda: application,
+    )
+    monkeypatch.setattr(
+        bot_main.Application,
+        "builder",
+        classmethod(lambda cls: builder),
+    )
+
+    bot_main.main()
+
+    reset_commands = [
+        handler
+        for handler in handlers
+        if isinstance(handler, CommandHandler)
+        and "reset_delivery" in handler.commands
+    ]
+    reset_callbacks = [
+        handler
+        for handler in handlers
+        if isinstance(handler, CallbackQueryHandler)
+        and handler.pattern is not None
+        and handler.pattern.pattern == r"^reset:"
+    ]
+
+    assert len(reset_commands) == 1
+    assert (
+        reset_commands[0].callback
+        is bot_main.reset_delivery_command
+    )
+    assert len(reset_callbacks) == 1
+    assert (
+        reset_callbacks[0].callback
+        is bot_main.reset_delivery_callback
+    )
+
+
+def test_legacy_db_migration_adds_delivery_cycle_id(tmp_path):
+    path = str(tmp_path / "legacy.db")
+    legacy = _create_legacy_sqlite_without_cycle_id(path)
+
+    assert "delivery_cycle_id" not in _leads_columns(path)
+
+    sessions = SessionRepository(path)
+    leads = LeadRepository(path)
+
+    assert "delivery_cycle_id" in _leads_columns(path)
+
+    # Повторная инициализация безопасна.
+    SessionRepository(path)
+    LeadRepository(path)
+
+    assert "delivery_cycle_id" in _leads_columns(path)
+
+    # Существующие записи сохранены.
+    with sqlite3.connect(path) as db:
+        lead_row = db.execute(
+            """
+            SELECT lead_id, user_id, session_json,
+                   delivery_status, created_at, delivery_cycle_id
+            FROM leads
+            WHERE lead_id = ?
+            """,
+            (legacy["lead_id"],),
+        ).fetchone()
+        session_row = db.execute(
+            """
+            SELECT session_json
+            FROM sessions
+            WHERE user_id = ?
+            """,
+            (legacy["user_id"],),
+        ).fetchone()
+        attempts = db.execute(
+            """
+            SELECT COUNT(*)
+            FROM delivery_attempts
+            WHERE lead_id = ?
+            """,
+            (legacy["lead_id"],),
+        ).fetchone()[0]
+        actions = db.execute(
+            """
+            SELECT COUNT(*)
+            FROM operator_actions
+            WHERE lead_id = ?
+            """,
+            (legacy["lead_id"],),
+        ).fetchone()[0]
+
+    assert lead_row is not None
+    assert lead_row[0] == legacy["lead_id"]
+    assert lead_row[1] == legacy["user_id"]
+    assert lead_row[2] == legacy["session_json"]
+    assert lead_row[3] == "sending"
+    assert lead_row[4] == legacy["created_at"]
+    assert lead_row[5] is None
+    assert session_row is not None
+    assert session_row[0] == legacy["session_json"]
+    assert attempts == 1
+    assert actions == 1
+
+    restored = leads.get(legacy["lead_id"])
+    active = sessions.get(legacy["user_id"])
+
+    assert restored is not None
+    assert restored.delivery_status == "sending"
+    assert active is not None
+    assert active.lead_id == legacy["lead_id"]
+
+
+def test_legacy_db_confirmation_works_after_migration(tmp_path):
+    path = str(tmp_path / "legacy_confirm.db")
+    legacy = _create_legacy_sqlite_without_cycle_id(path)
+
+    leads = LeadRepository(path)
+    operator_id = 999999
+
+    token = leads.create_delivery_reset_confirmation(
+        legacy["lead_id"],
+        operator_id,
+    )
+    assert token is not None
+
+    with sqlite3.connect(path) as db:
+        cycle_id = db.execute(
+            """
+            SELECT delivery_cycle_id
+            FROM leads
+            WHERE lead_id = ?
+            """,
+            (legacy["lead_id"],),
+        ).fetchone()[0]
+
+    assert cycle_id is not None
+
+    assert leads.confirm_delivery_reset(token, operator_id) == "ok"
+
+    saved = leads.get(legacy["lead_id"])
+    assert saved is not None
+    assert saved.delivery_status == "uncertain"
+
+    with sqlite3.connect(path) as db:
+        attempt = db.execute(
+            """
+            SELECT status
+            FROM delivery_attempts
+            WHERE lead_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (legacy["lead_id"],),
+        ).fetchone()
+        action = db.execute(
+            """
+            SELECT action
+            FROM operator_actions
+            WHERE lead_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (legacy["lead_id"],),
+        ).fetchone()
+
+    assert attempt == ("manually_reset",)
+    assert action == ("manual_reset_delivery",)
 
 

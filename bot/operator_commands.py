@@ -435,18 +435,42 @@ async def reset_delivery_command(
         )
         return
 
+    try:
+        token = repository.create_delivery_reset_confirmation(
+            lead_id,
+            update.effective_user.id,
+        )
+    except Exception:
+        logger.exception(
+            "Ошибка создания подтверждения сброса %s",
+            lead_id,
+        )
+        await update.effective_message.reply_text(
+            "Не удалось подготовить подтверждение сброса."
+        )
+        return
+
+    if token is None:
+        await update.effective_message.reply_text(
+            "Заявка не найдена или её статус "
+            "не позволяет выполнить сброс.\n"
+            "Допустимый статус: sending.\n"
+            "Проверьте /lead UUID."
+        )
+        return
+
     keyboard = InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
                     "Подтвердить сброс",
-                    callback_data=f"reset:yes:{lead_id}",
+                    callback_data=f"reset:yes:{token}",
                 ),
             ],
             [
                 InlineKeyboardButton(
                     "Отмена",
-                    callback_data=f"reset:no:{lead_id}",
+                    callback_data=f"reset:no:{token}",
                 ),
             ],
         ]
@@ -459,6 +483,8 @@ async def reset_delivery_command(
         "Telegram мог уже доставить уведомление. "
         "Повторная отправка может создать дубликат.\n\n"
         "Подтвердить перевод заявки в uncertain?\n\n"
+        "Кнопки действительны 5 минут и только "
+        "для текущего цикла доставки.\n\n"
         "Повторная отправка выполняется отдельно "
         "командой /retry.",
         reply_markup=keyboard,
@@ -497,34 +523,57 @@ async def reset_delivery_callback(
         return
 
     action = parts[1]
-    lead_id = resolve_lead_id(
-        get_repository(),
-        parts[2],
-    )
+    token = parts[2]
 
-    if action not in ("yes", "no") or lead_id is None:
+    if action not in ("yes", "no") or not token:
         await query.answer("Некорректные данные.")
         return
 
-    # Отмена не изменяет базу данных.
+    repository = get_repository()
+
+    # Отмена атомарно аннулирует токен, не меняя заявку.
     if action == "no":
+        try:
+            cancelled = repository.cancel_delivery_reset_confirmation(
+                token,
+                user.id,
+            )
+        except Exception:
+            logger.exception(
+                "Ошибка отмены подтверждения сброса доставки"
+            )
+            await query.answer(
+                "Ошибка сохранения.",
+                show_alert=True,
+            )
+            return
+
+        if not cancelled:
+            await query.answer(
+                "Подтверждение уже недействительно.",
+                show_alert=True,
+            )
+            await query.edit_message_text(
+                "Сброс доставки не выполнен.\n"
+                "Подтверждение просрочено, отменено "
+                "или уже использовано."
+            )
+            return
+
         await query.answer("Отменено.")
         await query.edit_message_text(
-            "Сброс доставки отменён.\n"
-            f"ID: {lead_id}"
+            "Сброс доставки отменён."
         )
         return
 
     try:
-        repository = get_repository()
-        result = repository.reset_delivery_manually(
-            lead_id,
+        result = repository.confirm_delivery_reset(
+            token,
             user.id,
         )
     except Exception:
         logger.exception(
-            "Ошибка ручного сброса доставки %s",
-            lead_id,
+            "Ошибка ручного сброса доставки"
         )
         await query.answer(
             "Ошибка сохранения.",
@@ -532,25 +581,44 @@ async def reset_delivery_callback(
         )
         return
 
-    if not result:
-        await query.answer(
-            "Статус заявки уже изменился.",
-            show_alert=True,
-        )
+    if result == "ok":
+        await query.answer("Сброс выполнен.")
         await query.edit_message_text(
-            "Сброс не выполнен.\n"
-            "Заявка отсутствует или её статус "
-            "уже не sending.\n"
-            f"ID: {lead_id}"
+            "Доставка переведена в uncertain.\n\n"
+            "Проверьте возможную предыдущую доставку "
+            "перед выполнением /retry."
         )
         return
 
-    await query.answer("Сброс выполнен.")
-    await query.edit_message_text(
-        "Доставка переведена в uncertain.\n"
-        f"ID: {lead_id}\n\n"
-        "Проверьте возможную предыдущую доставку "
-        "перед выполнением /retry."
+    if result == "expired":
+        message = (
+            "Сброс не выполнен.\n"
+            "Срок действия подтверждения истёк "
+            "(5 минут)."
+        )
+    elif result == "consumed":
+        message = (
+            "Сброс не выполнен.\n"
+            "Это подтверждение уже использовано "
+            "или отменено."
+        )
+    elif result == "stale":
+        message = (
+            "Сброс не выполнен.\n"
+            "Заявка изменилась или начат новый "
+            "цикл доставки.\n"
+            "Запросите /reset_delivery заново."
+        )
+    else:
+        message = (
+            "Сброс не выполнен.\n"
+            "Подтверждение недействительно."
+        )
+
+    await query.answer(
+        "Подтверждение недействительно.",
+        show_alert=True,
     )
+    await query.edit_message_text(message)
 
 

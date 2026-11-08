@@ -29,6 +29,33 @@ class SessionRepository:
                 """
             )
 
+            # Производственная база могла быть создана до
+            # появления delivery_cycle_id.
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    """
+                    SELECT name
+                    FROM sqlite_master
+                    WHERE type = 'table'
+                    """
+                )
+            }
+            if "leads" in tables:
+                columns = {
+                    row[1]
+                    for row in connection.execute(
+                        "PRAGMA table_info(leads)"
+                    )
+                }
+                if "delivery_cycle_id" not in columns:
+                    connection.execute(
+                        """
+                        ALTER TABLE leads
+                        ADD COLUMN delivery_cycle_id TEXT
+                        """
+                    )
+
     def get(self, user_id: int) -> LeadSession | None:
         with self._connect() as connection:
             row = connection.execute(
@@ -77,6 +104,10 @@ class SessionRepository:
         """Сохранить заявку, сессию и событие одной транзакцией."""
         from datetime import datetime, timezone
 
+        from services.storage.lead_repository import (
+            new_delivery_cycle_id,
+        )
+
         expected_status = {
             "accepted": "not_sent",
             "sending": "sending",
@@ -98,6 +129,12 @@ class SessionRepository:
 
         now = datetime.now(timezone.utc).isoformat()
         session_json = session.model_dump_json()
+        # Новый цикл только при входе в sending, не при retrying.
+        cycle_id = (
+            new_delivery_cycle_id()
+            if event_status == "sending"
+            else None
+        )
 
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -109,9 +146,22 @@ class SessionRepository:
                     session_json TEXT NOT NULL,
                     delivery_status TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    delivery_cycle_id TEXT
                 )
             """)
+
+            columns = {
+                row[1]
+                for row in db.execute("PRAGMA table_info(leads)")
+            }
+            if "delivery_cycle_id" not in columns:
+                db.execute(
+                    """
+                    ALTER TABLE leads
+                    ADD COLUMN delivery_cycle_id TEXT
+                    """
+                )
 
             db.execute("""
                 CREATE TABLE IF NOT EXISTS delivery_attempts (
@@ -136,29 +186,57 @@ class SessionRepository:
                 session_json,
             ))
 
-            db.execute("""
-                INSERT INTO leads (
-                    lead_id,
-                    user_id,
+            if cycle_id is not None:
+                db.execute("""
+                    INSERT INTO leads (
+                        lead_id,
+                        user_id,
+                        session_json,
+                        delivery_status,
+                        created_at,
+                        updated_at,
+                        delivery_cycle_id
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(lead_id)
+                    DO UPDATE SET
+                        session_json = excluded.session_json,
+                        delivery_status = excluded.delivery_status,
+                        updated_at = excluded.updated_at,
+                        delivery_cycle_id = excluded.delivery_cycle_id
+                """, (
+                    session.lead_id,
+                    session.user_id,
                     session_json,
-                    delivery_status,
-                    created_at,
-                    updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(lead_id)
-                DO UPDATE SET
-                    session_json = excluded.session_json,
-                    delivery_status = excluded.delivery_status,
-                    updated_at = excluded.updated_at
-            """, (
-                session.lead_id,
-                session.user_id,
-                session_json,
-                session.delivery_status,
-                now,
-                now,
-            ))
+                    session.delivery_status,
+                    now,
+                    now,
+                    cycle_id,
+                ))
+            else:
+                db.execute("""
+                    INSERT INTO leads (
+                        lead_id,
+                        user_id,
+                        session_json,
+                        delivery_status,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(lead_id)
+                    DO UPDATE SET
+                        session_json = excluded.session_json,
+                        delivery_status = excluded.delivery_status,
+                        updated_at = excluded.updated_at
+                """, (
+                    session.lead_id,
+                    session.user_id,
+                    session_json,
+                    session.delivery_status,
+                    now,
+                    now,
+                ))
 
             db.execute("""
                 INSERT INTO delivery_attempts (

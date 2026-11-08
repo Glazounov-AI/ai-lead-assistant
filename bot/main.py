@@ -29,6 +29,8 @@ from bot.operator_commands import (
     pending_command,
     retry_command,
     mark_sent_command,
+    reset_delivery_command,
+    reset_delivery_callback,
 )
 
 logging.basicConfig(
@@ -510,9 +512,23 @@ def main() -> None:
     )
 
     application.add_handler(
+        CommandHandler(
+            "reset_delivery",
+            reset_delivery_command,
+        )
+    )
+
+    application.add_handler(
         CallbackQueryHandler(
             confirm_lead,
             pattern=r"^lead_(confirm|edit)$",
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            reset_delivery_callback,
+            pattern=r"^reset:",
         )
     )
 

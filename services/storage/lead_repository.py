@@ -1,12 +1,21 @@
-﻿import sqlite3
-from datetime import datetime, timezone
+﻿import secrets
+import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from uuid import uuid4
 
 from core.schemas import LeadSession
 
 
+DELIVERY_RESET_TTL_SECONDS = 300
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def new_delivery_cycle_id() -> str:
+    return str(uuid4())
 
 
 class LeadRepository:
@@ -31,9 +40,22 @@ class LeadRepository:
                     session_json TEXT NOT NULL,
                     delivery_status TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    delivery_cycle_id TEXT
                 )
             """)
+
+            columns = {
+                row[1]
+                for row in db.execute("PRAGMA table_info(leads)")
+            }
+            if "delivery_cycle_id" not in columns:
+                db.execute(
+                    """
+                    ALTER TABLE leads
+                    ADD COLUMN delivery_cycle_id TEXT
+                    """
+                )
 
             db.execute("""
                 CREATE TABLE IF NOT EXISTS delivery_attempts (
@@ -53,6 +75,20 @@ class LeadRepository:
                     operator_id INTEGER NOT NULL,
                     action TEXT NOT NULL,
                     created_at TEXT NOT NULL,
+                    FOREIGN KEY (lead_id) REFERENCES leads(lead_id)
+                )
+            """)
+
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS delivery_reset_confirmations (
+                    token TEXT PRIMARY KEY,
+                    lead_id TEXT NOT NULL,
+                    operator_id INTEGER NOT NULL,
+                    delivery_cycle_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    used_at TEXT,
+                    cancelled_at TEXT,
                     FOREIGN KEY (lead_id) REFERENCES leads(lead_id)
                 )
             """)
@@ -203,17 +239,20 @@ class LeadRepository:
 
             session.delivery_status = "sending"
             now = utc_now()
+            cycle_id = new_delivery_cycle_id()
 
             db.execute(
                 """
                 UPDATE leads
                 SET session_json = ?,
                     delivery_status = 'sending',
+                    delivery_cycle_id = ?,
                     updated_at = ?
                 WHERE lead_id = ?
                 """,
                 (
                     session.model_dump_json(),
+                    cycle_id,
                     now,
                     lead_id,
                 ),
@@ -588,5 +627,296 @@ class LeadRepository:
             )
 
         return True
+
+    def create_delivery_reset_confirmation(
+        self,
+        lead_id: str,
+        operator_id: int,
+    ) -> str | None:
+        """Выдать одноразовый токен подтверждения сброса."""
+
+        now = datetime.now(timezone.utc)
+        created_at = now.isoformat()
+        expires_at = (
+            now + timedelta(seconds=DELIVERY_RESET_TTL_SECONDS)
+        ).isoformat()
+
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+
+            row = db.execute(
+                """
+                SELECT session_json, delivery_status, delivery_cycle_id
+                FROM leads
+                WHERE lead_id = ?
+                """,
+                (lead_id,),
+            ).fetchone()
+
+            if row is None or row["delivery_status"] != "sending":
+                return None
+
+            session = LeadSession.model_validate_json(
+                row["session_json"]
+            )
+
+            if not session.submitted:
+                return None
+
+            cycle_id = row["delivery_cycle_id"]
+            if not cycle_id:
+                cycle_id = new_delivery_cycle_id()
+                db.execute(
+                    """
+                    UPDATE leads
+                    SET delivery_cycle_id = ?
+                    WHERE lead_id = ?
+                    """,
+                    (cycle_id, lead_id),
+                )
+
+            # token_urlsafe(24) ≈ 32 символа; вместе с
+            # префиксом reset:yes: укладывается в 64 байта.
+            token = secrets.token_urlsafe(24)
+
+            db.execute(
+                """
+                INSERT INTO delivery_reset_confirmations (
+                    token,
+                    lead_id,
+                    operator_id,
+                    delivery_cycle_id,
+                    created_at,
+                    expires_at,
+                    used_at,
+                    cancelled_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)
+                """,
+                (
+                    token,
+                    lead_id,
+                    operator_id,
+                    cycle_id,
+                    created_at,
+                    expires_at,
+                ),
+            )
+
+        return token
+
+    def confirm_delivery_reset(
+        self,
+        token: str,
+        operator_id: int,
+    ) -> str:
+        """Атомарно подтвердить сброс по одноразовому токену.
+
+        Возвращает: ok | invalid | expired | consumed | stale
+        """
+
+        now = datetime.now(timezone.utc)
+        now_s = now.isoformat()
+
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+
+            confirmation = db.execute(
+                """
+                SELECT
+                    token,
+                    lead_id,
+                    operator_id,
+                    delivery_cycle_id,
+                    expires_at,
+                    used_at,
+                    cancelled_at
+                FROM delivery_reset_confirmations
+                WHERE token = ?
+                """,
+                (token,),
+            ).fetchone()
+
+            if confirmation is None:
+                return "invalid"
+
+            if confirmation["operator_id"] != operator_id:
+                return "invalid"
+
+            if (
+                confirmation["used_at"] is not None
+                or confirmation["cancelled_at"] is not None
+            ):
+                return "consumed"
+
+            expires_at = datetime.fromisoformat(
+                confirmation["expires_at"]
+            )
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+
+            if expires_at < now:
+                return "expired"
+
+            lead_id = confirmation["lead_id"]
+
+            row = db.execute(
+                """
+                SELECT session_json, delivery_status, delivery_cycle_id
+                FROM leads
+                WHERE lead_id = ?
+                """,
+                (lead_id,),
+            ).fetchone()
+
+            if (
+                row is None
+                or row["delivery_status"] != "sending"
+                or row["delivery_cycle_id"]
+                != confirmation["delivery_cycle_id"]
+            ):
+                return "stale"
+
+            session = LeadSession.model_validate_json(
+                row["session_json"]
+            )
+
+            if not session.submitted:
+                return "stale"
+
+            session.delivery_status = "uncertain"
+            session_json = session.model_dump_json()
+
+            db.execute(
+                """
+                UPDATE leads
+                SET session_json = ?,
+                    delivery_status = 'uncertain',
+                    updated_at = ?
+                WHERE lead_id = ?
+                """,
+                (session_json, now_s, lead_id),
+            )
+
+            active = db.execute(
+                """
+                SELECT session_json
+                FROM sessions
+                WHERE user_id = ?
+                """,
+                (session.user_id,),
+            ).fetchone()
+
+            if active is not None:
+                active_session = LeadSession.model_validate_json(
+                    active["session_json"]
+                )
+
+                if active_session.lead_id == lead_id:
+                    db.execute(
+                        """
+                        UPDATE sessions
+                        SET session_json = ?
+                        WHERE user_id = ?
+                        """,
+                        (session_json, session.user_id),
+                    )
+
+            db.execute(
+                """
+                INSERT INTO delivery_attempts (
+                    lead_id,
+                    status,
+                    telegram_message_id,
+                    created_at
+                )
+                VALUES (?, 'manually_reset', NULL, ?)
+                """,
+                (lead_id, now_s),
+            )
+
+            db.execute(
+                """
+                INSERT INTO operator_actions (
+                    lead_id,
+                    operator_id,
+                    action,
+                    created_at
+                )
+                VALUES (?, ?, 'manual_reset_delivery', ?)
+                """,
+                (lead_id, operator_id, now_s),
+            )
+
+            db.execute(
+                """
+                UPDATE delivery_reset_confirmations
+                SET used_at = ?
+                WHERE token = ?
+                  AND used_at IS NULL
+                  AND cancelled_at IS NULL
+                """,
+                (now_s, token),
+            )
+
+            if db.execute(
+                """
+                SELECT changes()
+                """
+            ).fetchone()[0] != 1:
+                raise sqlite3.OperationalError(
+                    "confirmation token race"
+                )
+
+        return "ok"
+
+    def cancel_delivery_reset_confirmation(
+        self,
+        token: str,
+        operator_id: int,
+    ) -> bool:
+        """Атомарно аннулировать токен без изменения заявки."""
+
+        now_s = utc_now()
+
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+
+            confirmation = db.execute(
+                """
+                SELECT
+                    operator_id,
+                    used_at,
+                    cancelled_at
+                FROM delivery_reset_confirmations
+                WHERE token = ?
+                """,
+                (token,),
+            ).fetchone()
+
+            if confirmation is None:
+                return False
+
+            if confirmation["operator_id"] != operator_id:
+                return False
+
+            if (
+                confirmation["used_at"] is not None
+                or confirmation["cancelled_at"] is not None
+            ):
+                return False
+
+            db.execute(
+                """
+                UPDATE delivery_reset_confirmations
+                SET cancelled_at = ?
+                WHERE token = ?
+                  AND used_at IS NULL
+                  AND cancelled_at IS NULL
+                """,
+                (now_s, token),
+            )
+
+            return db.execute("SELECT changes()").fetchone()[0] == 1
 
 
