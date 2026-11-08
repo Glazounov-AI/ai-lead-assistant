@@ -471,3 +471,122 @@ class LeadRepository:
             )
 
         return True
+
+
+    def reset_delivery_manually(
+        self,
+        lead_id: str,
+        operator_id: int,
+    ) -> bool:
+        """Ручной сброс sending -> uncertain после подтверждения."""
+
+        now = utc_now()
+
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+
+            row = db.execute(
+                """
+                SELECT session_json, delivery_status
+                FROM leads
+                WHERE lead_id = ?
+                """,
+                (lead_id,),
+            ).fetchone()
+
+            if row is None or row[1] != "sending":
+                return False
+
+            session = LeadSession.model_validate_json(row[0])
+
+            if not session.submitted:
+                return False
+
+            session.delivery_status = "uncertain"
+            session_json = session.model_dump_json()
+
+            db.execute(
+                """
+                UPDATE leads
+                SET session_json = ?,
+                    delivery_status = ?,
+                    updated_at = ?
+                WHERE lead_id = ?
+                """,
+                (
+                    session_json,
+                    "uncertain",
+                    now,
+                    lead_id,
+                ),
+            )
+
+            # Обновляем активную сессию только для той же заявки.
+            active = db.execute(
+                """
+                SELECT session_json
+                FROM sessions
+                WHERE user_id = ?
+                """,
+                (session.user_id,),
+            ).fetchone()
+
+            if active is not None:
+                active_session = LeadSession.model_validate_json(
+                    active[0]
+                )
+
+                if active_session.lead_id == lead_id:
+                    db.execute(
+                        """
+                        UPDATE sessions
+                        SET session_json = ?
+                        WHERE user_id = ?
+                        """,
+                        (
+                            session_json,
+                            session.user_id,
+                        ),
+                    )
+
+            # Сохраняем историю изменения доставки.
+            db.execute(
+                """
+                INSERT INTO delivery_attempts (
+                    lead_id,
+                    status,
+                    telegram_message_id,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    lead_id,
+                    "manually_reset",
+                    None,
+                    now,
+                ),
+            )
+
+            # Регистрируем действие оператора.
+            db.execute(
+                """
+                INSERT INTO operator_actions (
+                    lead_id,
+                    operator_id,
+                    action,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    lead_id,
+                    operator_id,
+                    "manual_reset_delivery",
+                    now,
+                ),
+            )
+
+        return True
+
+

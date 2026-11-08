@@ -3,7 +3,11 @@ import logging
 
 from uuid import UUID
 
-from telegram import Update
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import ContextTypes
 from telegram.error import TelegramError
 
@@ -379,3 +383,174 @@ async def mark_sent_command(
         "Доставка подтверждена оператором.\n"
         f"ID: {lead_id}"
     )
+
+
+async def reset_delivery_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not await authorize(update):
+        return
+
+    if len(context.args or []) != 1:
+        await update.effective_message.reply_text(
+            "Использование: /reset_delivery UUID"
+        )
+        return
+
+    repository = get_repository()
+    lead_id = resolve_lead_id(
+        repository,
+        context.args[0],
+    )
+
+    if lead_id is None:
+        await update.effective_message.reply_text(
+            "Некорректный UUID."
+        )
+        return
+
+    try:
+        session = repository.get(lead_id)
+    except Exception:
+        logger.exception(
+            "Ошибка чтения заявки для сброса %s",
+            lead_id,
+        )
+        await update.effective_message.reply_text(
+            "Не удалось получить заявку из базы данных."
+        )
+        return
+
+    if (
+        session is None
+        or not session.submitted
+        or session.delivery_status != "sending"
+    ):
+        await update.effective_message.reply_text(
+            "Заявка не найдена или её статус "
+            "не позволяет выполнить сброс.\n"
+            "Допустимый статус: sending.\n"
+            "Проверьте /lead UUID."
+        )
+        return
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "Подтвердить сброс",
+                    callback_data=f"reset:yes:{lead_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "Отмена",
+                    callback_data=f"reset:no:{lead_id}",
+                ),
+            ],
+        ]
+    )
+
+    await update.effective_message.reply_text(
+        "⚠️ Подтверждение сброса доставки\n\n"
+        f"ID: {lead_id}\n"
+        "Текущий статус: sending\n\n"
+        "Telegram мог уже доставить уведомление. "
+        "Повторная отправка может создать дубликат.\n\n"
+        "Подтвердить перевод заявки в uncertain?\n\n"
+        "Повторная отправка выполняется отдельно "
+        "командой /retry.",
+        reply_markup=keyboard,
+    )
+
+
+async def reset_delivery_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+
+    # Проверяем права при каждом нажатии кнопки.
+    user = update.effective_user
+    chat = update.effective_chat
+
+    if (
+        user is None
+        or chat is None
+        or chat.type != "private"
+        or not is_operator(user.id)
+    ):
+        await query.answer(
+            "Действие недоступно.",
+            show_alert=True,
+        )
+        return
+
+    data = query.data or ""
+    parts = data.split(":")
+
+    if len(parts) != 3 or parts[0] != "reset":
+        await query.answer("Некорректная команда.")
+        return
+
+    action = parts[1]
+    lead_id = resolve_lead_id(
+        get_repository(),
+        parts[2],
+    )
+
+    if action not in ("yes", "no") or lead_id is None:
+        await query.answer("Некорректные данные.")
+        return
+
+    # Отмена не изменяет базу данных.
+    if action == "no":
+        await query.answer("Отменено.")
+        await query.edit_message_text(
+            "Сброс доставки отменён.\n"
+            f"ID: {lead_id}"
+        )
+        return
+
+    try:
+        repository = get_repository()
+        result = repository.reset_delivery_manually(
+            lead_id,
+            user.id,
+        )
+    except Exception:
+        logger.exception(
+            "Ошибка ручного сброса доставки %s",
+            lead_id,
+        )
+        await query.answer(
+            "Ошибка сохранения.",
+            show_alert=True,
+        )
+        return
+
+    if not result:
+        await query.answer(
+            "Статус заявки уже изменился.",
+            show_alert=True,
+        )
+        await query.edit_message_text(
+            "Сброс не выполнен.\n"
+            "Заявка отсутствует или её статус "
+            "уже не sending.\n"
+            f"ID: {lead_id}"
+        )
+        return
+
+    await query.answer("Сброс выполнен.")
+    await query.edit_message_text(
+        "Доставка переведена в uncertain.\n"
+        f"ID: {lead_id}\n\n"
+        "Проверьте возможную предыдущую доставку "
+        "перед выполнением /retry."
+    )
+
+

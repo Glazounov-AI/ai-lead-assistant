@@ -1,5 +1,7 @@
 ﻿import asyncio
 import sqlite3
+import pytest
+
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -602,5 +604,476 @@ def test_mark_sent_command_sqlite_failure(monkeypatch, tmp_path):
 
     assert attempts == 0
     assert actions == 0
+
+
+def test_manual_reset_delivery_success(tmp_path):
+    path, leads, session = prepare_lead(
+        tmp_path,
+        status="sending",
+    )
+
+    operator_id = 999999
+
+    result = leads.reset_delivery_manually(
+        session.lead_id,
+        operator_id,
+    )
+
+    assert result is True
+
+    # Заявка перешла в uncertain.
+    saved = leads.get(session.lead_id)
+
+    assert saved is not None
+    assert saved.submitted is True
+    assert saved.delivery_status == "uncertain"
+
+    # Проверяем журнал событий и действий оператора.
+    with sqlite3.connect(path) as db:
+        attempt = db.execute(
+            """
+            SELECT status, telegram_message_id
+            FROM delivery_attempts
+            WHERE lead_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (session.lead_id,),
+        ).fetchone()
+
+        action = db.execute(
+            """
+            SELECT operator_id, action
+            FROM operator_actions
+            WHERE lead_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (session.lead_id,),
+        ).fetchone()
+
+    assert attempt == ("manually_reset", None)
+    assert action == (
+        operator_id,
+        "manual_reset_delivery",
+    )
+
+    # Проверяем возможность повторной отправки
+    # только после проверки истории ручного сброса.
+    assert leads.claim_retry(session.lead_id) is not None
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["sent", "uncertain", "not_sent"],
+)
+def test_manual_reset_delivery_rejects_invalid_status(
+    tmp_path,
+    status,
+):
+    path, leads, session = prepare_lead(
+        tmp_path,
+        status=status,
+    )
+
+    result = leads.reset_delivery_manually(
+        session.lead_id,
+        999999,
+    )
+
+    assert result is False
+
+    # Исходный статус не изменился.
+    saved = leads.get(session.lead_id)
+
+    assert saved is not None
+    assert saved.delivery_status == status
+
+    # События ручного сброса не создавались.
+    with sqlite3.connect(path) as db:
+        attempts = db.execute(
+            """
+            SELECT COUNT(*)
+            FROM delivery_attempts
+            WHERE lead_id = ?
+              AND status = 'manually_reset'
+            """,
+            (session.lead_id,),
+        ).fetchone()[0]
+
+        actions = db.execute(
+            """
+            SELECT COUNT(*)
+            FROM operator_actions
+            WHERE lead_id = ?
+              AND action = 'manual_reset_delivery'
+            """,
+            (session.lead_id,),
+        ).fetchone()[0]
+
+    assert attempts == 0
+    assert actions == 0
+
+
+def test_manual_reset_delivery_rollback(tmp_path):
+    path, leads, session = prepare_lead(
+        tmp_path,
+        status="sending",
+    )
+
+    # Имитируем ошибку записи аудита.
+    with sqlite3.connect(path) as db:
+        db.execute(
+            """
+            CREATE TRIGGER fail_manual_reset_audit
+            BEFORE INSERT ON operator_actions
+            WHEN NEW.action = 'manual_reset_delivery'
+            BEGIN
+                SELECT RAISE(ABORT, 'audit write failed');
+            END;
+            """
+        )
+
+    # Операция должна завершиться ошибкой SQLite.
+    with pytest.raises(
+        sqlite3.DatabaseError,
+        match="audit write failed",
+    ):
+        leads.reset_delivery_manually(
+            session.lead_id,
+            999999,
+        )
+
+    # Статус заявки остался прежним.
+    saved = leads.get(session.lead_id)
+
+    assert saved is not None
+    assert saved.delivery_status == "sending"
+
+    # Активная сессия тоже не изменилась.
+    with sqlite3.connect(path) as db:
+        row = db.execute(
+            """
+            SELECT session_json
+            FROM sessions
+            WHERE user_id = ?
+            """,
+            (session.user_id,),
+        ).fetchone()
+
+        assert row is not None
+
+        active = LeadSession.model_validate_json(row[0])
+        assert active.delivery_status == "sending"
+
+        # Запись о ручном сбросе также откатилась.
+        count = db.execute(
+            """
+            SELECT COUNT(*)
+            FROM delivery_attempts
+            WHERE lead_id = ?
+              AND status = 'manually_reset'
+            """,
+            (session.lead_id,),
+        ).fetchone()[0]
+
+        assert count == 0
+
+
+def test_reset_delivery_callback_cancel(
+    tmp_path,
+    monkeypatch,
+):
+    from unittest.mock import AsyncMock
+    from types import SimpleNamespace
+    import asyncio
+
+    from bot import operator_commands as commands
+
+    path, leads, session = prepare_lead(
+        tmp_path,
+        status="sending",
+    )
+
+    monkeypatch.setenv("DATABASE_PATH", path)
+    monkeypatch.setenv(
+        "TELEGRAM_OPERATOR_CHAT_ID",
+        "999999",
+    )
+
+    query = SimpleNamespace(
+        data=f"reset:no:{session.lead_id}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    update = SimpleNamespace(
+        callback_query=query,
+        effective_user=SimpleNamespace(id=999999),
+        effective_chat=SimpleNamespace(type="private"),
+    )
+
+    context = SimpleNamespace()
+
+    asyncio.run(
+        commands.reset_delivery_callback(
+            update,
+            context,
+        )
+    )
+
+    query.answer.assert_awaited_once_with("Отменено.")
+    query.edit_message_text.assert_awaited_once()
+
+    # Статус заявки остался прежним.
+    saved = leads.get(session.lead_id)
+
+    assert saved is not None
+    assert saved.delivery_status == "sending"
+
+    # Ручной сброс не записывался в историю.
+    with sqlite3.connect(path) as db:
+        count = db.execute(
+            """
+            SELECT COUNT(*)
+            FROM operator_actions
+            WHERE lead_id = ?
+              AND action = 'manual_reset_delivery'
+            """,
+            (session.lead_id,),
+        ).fetchone()[0]
+
+    assert count == 0
+
+
+def test_reset_delivery_callback_confirm(
+    tmp_path,
+    monkeypatch,
+):
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from bot import operator_commands as commands
+
+    path, leads, session = prepare_lead(
+        tmp_path,
+        status="sending",
+    )
+
+    monkeypatch.setenv("DATABASE_PATH", path)
+    monkeypatch.setenv(
+        "TELEGRAM_OPERATOR_CHAT_ID",
+        "999999",
+    )
+
+    query = SimpleNamespace(
+        data=f"reset:yes:{session.lead_id}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    update = SimpleNamespace(
+        callback_query=query,
+        effective_user=SimpleNamespace(id=999999),
+        effective_chat=SimpleNamespace(type="private"),
+    )
+
+    asyncio.run(
+        commands.reset_delivery_callback(
+            update,
+            SimpleNamespace(),
+        )
+    )
+
+    # Telegram получил подтверждение нажатия.
+    query.answer.assert_awaited_once_with(
+        "Сброс выполнен."
+    )
+    query.edit_message_text.assert_awaited_once()
+
+    # Статус заявки изменился.
+    saved = leads.get(session.lead_id)
+
+    assert saved is not None
+    assert saved.delivery_status == "uncertain"
+
+    # Действие оператора записано.
+    with sqlite3.connect(path) as db:
+        action = db.execute(
+            """
+            SELECT operator_id, action
+            FROM operator_actions
+            WHERE lead_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (session.lead_id,),
+        ).fetchone()
+
+        attempt = db.execute(
+            """
+            SELECT status
+            FROM delivery_attempts
+            WHERE lead_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (session.lead_id,),
+        ).fetchone()
+
+    assert action == (
+        999999,
+        "manual_reset_delivery",
+    )
+    assert attempt == ("manually_reset",)
+
+
+def test_reset_delivery_callback_double_confirm(
+    tmp_path,
+    monkeypatch,
+):
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from bot import operator_commands as commands
+
+    path, leads, session = prepare_lead(
+        tmp_path,
+        status="sending",
+    )
+
+    monkeypatch.setenv("DATABASE_PATH", path)
+    monkeypatch.setenv(
+        "TELEGRAM_OPERATOR_CHAT_ID",
+        "999999",
+    )
+
+    query = SimpleNamespace(
+        data=f"reset:yes:{session.lead_id}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    update = SimpleNamespace(
+        callback_query=query,
+        effective_user=SimpleNamespace(id=999999),
+        effective_chat=SimpleNamespace(type="private"),
+    )
+
+    async def run_twice():
+        await commands.reset_delivery_callback(
+            update,
+            SimpleNamespace(),
+        )
+        await commands.reset_delivery_callback(
+            update,
+            SimpleNamespace(),
+        )
+
+    asyncio.run(run_twice())
+
+    saved = leads.get(session.lead_id)
+
+    assert saved is not None
+    assert saved.delivery_status == "uncertain"
+
+    with sqlite3.connect(path) as db:
+        attempts = db.execute(
+            """
+            SELECT COUNT(*)
+            FROM delivery_attempts
+            WHERE lead_id = ?
+              AND status = 'manually_reset'
+            """,
+            (session.lead_id,),
+        ).fetchone()[0]
+
+        actions = db.execute(
+            """
+            SELECT COUNT(*)
+            FROM operator_actions
+            WHERE lead_id = ?
+              AND action = 'manual_reset_delivery'
+            """,
+            (session.lead_id,),
+        ).fetchone()[0]
+
+    assert attempts == 1
+    assert actions == 1
+
+    assert query.answer.await_count == 2
+    assert query.edit_message_text.await_count == 2
+
+
+def test_reset_delivery_callback_unauthorized(
+    tmp_path,
+    monkeypatch,
+):
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from bot import operator_commands as commands
+
+    path, leads, session = prepare_lead(
+        tmp_path,
+        status="sending",
+    )
+
+    monkeypatch.setenv("DATABASE_PATH", path)
+    monkeypatch.setenv(
+        "TELEGRAM_OPERATOR_CHAT_ID",
+        "999999",
+    )
+
+    query = SimpleNamespace(
+        data=f"reset:yes:{session.lead_id}",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    update = SimpleNamespace(
+        callback_query=query,
+        effective_user=SimpleNamespace(id=123456),
+        effective_chat=SimpleNamespace(type="private"),
+    )
+
+    asyncio.run(
+        commands.reset_delivery_callback(
+            update,
+            SimpleNamespace(),
+        )
+    )
+
+    # Постороннему пользователю отказано.
+    query.answer.assert_awaited_once_with(
+        "Действие недоступно.",
+        show_alert=True,
+    )
+
+    # Сообщение с кнопками не изменяется.
+    query.edit_message_text.assert_not_awaited()
+
+    # Заявка осталась в sending.
+    saved = leads.get(session.lead_id)
+
+    assert saved is not None
+    assert saved.delivery_status == "sending"
+
+    # Аудит ручного сброса не создавался.
+    with sqlite3.connect(path) as db:
+        count = db.execute(
+            """
+            SELECT COUNT(*)
+            FROM operator_actions
+            WHERE lead_id = ?
+              AND action = 'manual_reset_delivery'
+            """,
+            (session.lead_id,),
+        ).fetchone()[0]
+
+    assert count == 0
 
 
